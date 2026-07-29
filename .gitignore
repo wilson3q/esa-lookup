@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtualenvs
+.venv/
+venv/
+env/
+.venv-build/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Runtime / logs
+*.log
+tmp/
+temp/
+esa_lookup/logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
