@@ -3,6 +3,20 @@
 Windows GUI app that mass-looks-up SAP data into an Excel file. Replaces the
 per-cell notebook workflow with ALV grid exports + bulk Excel writes.
 
+## Gen 4 (this branch): in-memory chaining, single write pass
+
+Steps no longer write to Excel one-by-one. All SAP lookups run first and
+chain **in memory** (e.g. TO step 3 keys off the OBJNR values step 2 just
+fetched, not off column C in the sheet); the workbook is then written
+**once**, at the end. Consequences:
+
+- A failure or Stop during the SAP phase leaves the workbook **completely
+  untouched** -- no more partially-updated files.
+- Large runs are faster: 1 bulk key-read + 1 bulk write total instead of
+  a write+re-read round-trip between every step.
+- Output columns, matching rules, and preserve/clear semantics are
+  unchanged from the previous version.
+
 ## Prerequisites
 
 - Windows with **SAP GUI for Windows** installed (Java client is not supported)

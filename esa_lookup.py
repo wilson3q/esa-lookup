@@ -127,8 +127,9 @@ class App:
             "   5.  Click 'Run'.  Do NOT close SAP GUI or Excel while it runs -\n"
             "        the app is driving both windows for you.\n"
             "\n"
-            "Watch Status / Progress / Log while it works.  Click 'Stop' to cancel\n"
-            "after the current step.  When done, the Excel file is filled in + saved."
+            "Watch Status / Progress / Log while it works.  Click 'Stop' to cancel -\n"
+            "nothing is written to the Excel file unless every SAP step succeeds.\n"
+            "When done, the file is filled in via one final write pass + saved."
         )
         ttk.Label(
             instr, text=instructions_text, style="Hint.TLabel",
@@ -249,7 +250,9 @@ class App:
     def _on_stop(self) -> None:
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
-            self._append_log("Stop requested -- will halt after the current step.", "warn")
+            self._append_log(
+                "Stop requested -- will halt after the current SAP step; "
+                "the Excel file will not be modified.", "warn")
 
     # -- worker <-> UI plumbing --------------------------------------------
 

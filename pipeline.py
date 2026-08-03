@@ -1,5 +1,11 @@
 """Orchestrator: chain SAP lookups + Excel bulk I/O for one workflow.
 
+Gen 4: all SAP lookups run first and chain IN MEMORY (a step whose key
+column was produced by an earlier step reads that step's fetched values
+directly, not the workbook); the workbook is then written once, in a single
+final pass. A failure or Stop during the SAP phase leaves the workbook
+completely untouched.
+
 Emits progress/log/status events through a callback so the tkinter GUI can
 render them from its main thread.
 """
@@ -447,8 +453,72 @@ def _build_lookup(
     return out, dup_count, blank_key_count
 
 
-def _run_step(
+class VirtualSheet:
+    """Gen 4 key-column resolver.
+
+    Columns PRODUCED by an earlier step in this run are served from memory
+    (`publish`); everything else is read from the workbook. This is what
+    lets TO step 3 key off the OBJNR values step 2 just fetched, without an
+    intermediate Excel write/read round-trip. A column no step has produced
+    falls back to the workbook -- which also preserves the Gen 2/3 behavior
+    for a skipped/no-op producer step (the consumer then sees whatever was
+    already in the sheet, exactly as before).
+
+    `last_row` mirrors Excel's End(xlUp) for in-memory columns by taking the
+    last row whose value is non-empty (the Excel path wrote "" into
+    non-matched cells, which End(xlUp) skips over as blanks).
+    """
+
+    def __init__(self, sheet):
+        self.sheet = sheet
+        self._mem: dict[int, list] = {}
+
+    def publish(self, col: int, values: list) -> None:
+        """Register `values` as the would-be content of rows 2..2+len-1."""
+        self._mem[col] = values
+
+    def is_virtual(self, col: int) -> bool:
+        return col in self._mem
+
+    def last_row(self, col: int) -> int:
+        if col in self._mem:
+            last = 1
+            for i, v in enumerate(self._mem[col]):
+                if _clean_cell(v) != "":
+                    last = i + 2
+            return last
+        return excel_ops.last_row_in_column(self.sheet, col)
+
+    def get_col(self, col: int, last_row: int) -> list:
+        """Values for rows 2..last_row, padded with '' beyond available data
+        (Excel semantics: cells below a produced/short column read as blank
+        because the producing step's clear ran down to Rows.Count)."""
+        n = max(0, last_row - 1)
+        if col in self._mem:
+            vals = list(self._mem[col][:n])
+        else:
+            rng = f"{_col_letter(col)}2:{_col_letter(col)}{last_row}"
+            rows = excel_ops.read_range_2d(self.sheet, rng)
+            vals = [(r[0] if r else "") for r in rows]
+        return vals + [""] * (n - len(vals))
+
+
+@dataclass
+class StepResult:
+    """Everything a fetched step carries into the deferred write-back."""
+    step: LookupStep
+    step_index: int
+    last_row: int
+    excel_keys: list[str]
+    entries_by_row: list[dict | None]
+    n_skipped: int
+    matched: int
+    unmatched: int
+
+
+def _fetch_step(
     step: LookupStep,
+    vsheet: VirtualSheet,
     xl: excel_ops.ExcelCtx,
     sap: sap_ops.SapSession,
     tmp_dir: str,
@@ -456,68 +526,76 @@ def _run_step(
     step_index: int,
     total_steps: int,
     stop: threading.Event,
-) -> tuple[int, int]:
-    """Run one lookup step. Returns (matched, unmatched) row counts."""
+) -> StepResult | None:
+    """Run the SAP side of one lookup step and match it against the step's
+    key column -- WITHOUT touching the workbook. Returns None when the step
+    is a no-op (empty key column / no usable values).
 
-    def sub_progress(sub_i: int, sub_n: int = 7):
-        overall = (step_index + sub_i / sub_n) / total_steps
-        _progress(on_event, overall)
+    Gen 4: key columns written by an earlier step in this run resolve from
+    memory via `vsheet`, so steps chain without an Excel round-trip.
+    """
+
+    # Progress: total_steps fetch segments + one final write segment.
+    n_segments = total_steps + 1
+
+    def sub_progress(sub_i: int, sub_n: int = 6):
+        _progress(on_event, (step_index + sub_i / sub_n) / n_segments)
 
     step_started = time.time()
     if stop.is_set():
         raise Cancelled()
 
-    # --- 1. Read Excel keys in one COM call ------------------------------
-    _status(on_event, f"[{step_index + 1}/{total_steps}] {step.name}: reading Excel keys")
+    # --- 1. Resolve key columns (memory first, Excel otherwise) ----------
+    _status(on_event, f"[{step_index + 1}/{total_steps}] {step.name}: reading keys")
     _log(on_event, f"--- Step {step_index + 1}/{total_steps}: {step.name}  "
                     f"(table={step.sap_table}, key_cols={step.key_columns})")
-    sheet = xl.sheet
 
     # Fix F: each step derives its own last_row from its own primary key
     # column (matches notebook, which re-computes last_row per step). A short
     # column later in the workflow doesn't process phantom rows from a
     # longer column earlier in the workflow.
     primary_col = step.key_columns[0]
-    last_row = excel_ops.last_row_in_column(sheet, primary_col)
+    if vsheet.is_virtual(primary_col):
+        _log(on_event,
+             f"key column {_col_letter(primary_col)} resolved from an earlier "
+             f"step's in-memory result (no Excel round-trip)")
+    last_row = vsheet.last_row(primary_col)
     if last_row < 2:
         _log(on_event,
              f"No data below the header in column {_col_letter(primary_col)} "
              f"(#{primary_col}); step skipped", "warn")
-        _progress(on_event, (step_index + 1) / total_steps)
-        return (0, 0)
+        _progress(on_event, (step_index + 1) / n_segments)
+        return None
 
-    key_col_min, key_col_max = min(step.key_columns), max(step.key_columns)
-    key_range = _range(key_col_min, key_col_max, 2, last_row)
-    key_rows = excel_ops.read_range_2d(sheet, key_range)
+    key_vals = {c: vsheet.get_col(c, last_row) for c in step.key_columns}
+    n_rows = last_row - 1
     sub_progress(1)
-
-    first_key_offset = step.key_columns[0] - key_col_min
-
-    def row_key(vals: list) -> str:
-        offset_map = {c - key_col_min: c for c in step.key_columns}
-        parts = [normalize_key(vals[offset]) for offset in sorted(offset_map)]
-        return step.key_joiner.join(parts)
 
     # excel_keys is the normalized composite for every row -- used for both
     # lookup matching and (when match_key_column is set) the P-column audit
     # write. Notebook builds the identical string via `normalize_key(...)|
-    # normalize_key(...)` inside its per-row loop.
-    excel_keys = [row_key(r) for r in key_rows]
+    # normalize_key(...)` inside its per-row loop. Parts are joined in
+    # ascending column order (matches the Gen 2/3 offset-sorted read).
+    ordered_cols = sorted(step.key_columns)
+    excel_keys = [
+        step.key_joiner.join(normalize_key(key_vals[c][i]) for c in ordered_cols)
+        for i in range(n_rows)
+    ]
     # Skip flags: only used to (a) exclude from SAP paste, (b) count for the
-    # log summary. The write-back loop treats skip rows as non-matches, which
+    # log summary. The write-back treats skip rows as non-matches, which
     # is what the notebook does implicitly (its else branch fires for any
     # composite key that's not in the SAP result set, including "NOTFOUND|").
-    skip_flags = [_is_skip_key_cell(r[first_key_offset]) for r in key_rows]
+    skip_flags = [_is_skip_key_cell(key_vals[primary_col][i]) for i in range(n_rows)]
 
     unique_paste_values: list[str] = []
     seen: set[str] = set()
-    for r, skipped in zip(key_rows, skip_flags):
-        if skipped:
+    for i in range(n_rows):
+        if skip_flags[i]:
             continue
         # For paste, use the FIRST key column value (SAP filter dialog is
         # single-column). Multi-column keys still work because SAP returns
         # the full result set and we filter by composite key on our side.
-        v = clean_numeric_for_sap(r[first_key_offset])
+        v = clean_numeric_for_sap(key_vals[primary_col][i])
         if v and v not in seen:
             seen.add(v)
             unique_paste_values.append(v)
@@ -534,8 +612,8 @@ def _run_step(
              f"No usable values in column(s) {step.key_columns} "
              f"(after skipping blanks / 'NOT FOUND'); step is a no-op",
              "warn")
-        _progress(on_event, (step_index + 1) / total_steps)
-        return (0, 0)
+        _progress(on_event, (step_index + 1) / n_segments)
+        return None
 
     _log(on_event, f"{len(unique_paste_values)} unique key(s) will be sent to SAP")
     sub_progress(2)
@@ -598,11 +676,11 @@ def _run_step(
              f"note: skipped {blank_key_count} SAP row(s) with blank/partial "
              f"key columns", "info")
 
-    # --- 5. Resolve each Excel row's fate: matched vs. else --------------
+    # --- 5. Resolve each row's fate: matched vs. else --------------------
     # Skip rows use the same else branch as SAP non-matches -- the notebook
     # write loop makes no distinction (both fall through to the same clear
     # branch). See _SKIP_KEY_MARKERS docstring.
-    _status(on_event, f"[{step_index + 1}/{total_steps}] matching keys and writing back to Excel")
+    _status(on_event, f"[{step_index + 1}/{total_steps}] matching keys in memory")
     matched = 0
     entries_by_row: list[dict | None] = []
     for k, skipped in zip(excel_keys, skip_flags):
@@ -614,97 +692,17 @@ def _run_step(
         if entry is not None:
             matched += 1
 
-    n_rows = len(excel_keys)
-    rows_count = int(sheet.Rows.Count)
-
-    # --- 6. Bulk write to Excel -----------------------------------------
-    with excel_ops.bulk_write(xl.app):
-        # -------- Main output block -------------------------------------
-        oc_min = min(step.excel_output_columns)
-        oc_max = max(step.excel_output_columns)
-        oc_span = oc_max - oc_min + 1
-        target_write = _range(oc_min, oc_max, 2, last_row)
-        # Match notebook: clear the ENTIRE column range down to Rows.Count so
-        # stale rows below last_row (from a prior, longer run) are wiped.
-        target_clear = _range(oc_min, oc_max, 2, rows_count)
-
-        main_out: list[list] = []
-        for i in range(n_rows):
-            entry = entries_by_row[i]
-            row_vals = ["" for _ in range(oc_span)]
-            if entry is not None:
-                for j, sap_c in enumerate(step.sap_output_columns):
-                    excel_c = step.excel_output_columns[j]
-                    offset = excel_c - oc_min
-                    val = entry[sap_c]
-                    row_vals[offset] = "" if val is None else val
-            main_out.append(row_vals)
-
-        excel_ops.clear_range(sheet, target_clear)
-        excel_ops.set_column_format_text(
-            sheet, f"{_col_letter(oc_min)}:{_col_letter(oc_max)}"
-        )
-        excel_ops.write_range_2d(sheet, target_write, main_out)
-
-        # -------- Extras (per-column, with per-column semantics) --------
-        for extra in step.extras:
-            letter = _col_letter(extra.excel_col)
-            xrange = f"{letter}2:{letter}{last_row}"
-
-            # Read existing only when at least one row will preserve it.
-            need_existing = extra.preserve_on_nonmatch or extra.sap_col is None
-            existing_extra = (
-                excel_ops.read_range_2d(sheet, xrange) if need_existing else None
-            )
-
-            col_data: list[list] = []
-            for i in range(n_rows):
-                existing_val = (
-                    existing_extra[i][0]
-                    if (existing_extra and i < len(existing_extra)
-                        and existing_extra[i])
-                    else ""
-                )
-                entry = entries_by_row[i]
-                if entry is not None:
-                    # Matched row.
-                    if extra.sap_col is None:
-                        # No SAP source -> preserve on match
-                        # (mirrors notebook TO-3 col J behavior).
-                        col_data.append([existing_val])
-                    else:
-                        v = entry[extra.sap_col]
-                        col_data.append(["" if v is None else v])
-                else:
-                    # Non-match OR skip (treated the same, per notebook).
-                    if extra.preserve_on_nonmatch:
-                        col_data.append([existing_val])
-                    else:
-                        col_data.append([""])
-
-            # Only set text format on columns where we're writing SAP data;
-            # a preserve-only column (sap_col=None) should keep whatever
-            # NumberFormat the user had -- notebook doesn't touch it.
-            if extra.sap_col is not None:
-                excel_ops.set_column_format_text(sheet, f"{letter}:{letter}")
-            excel_ops.write_range_2d(sheet, xrange, col_data)
-
-        # -------- Match key column (P for TO-2) --------------------------
-        if step.match_key_column is not None:
-            mk_letter = _col_letter(step.match_key_column)
-            # Header at row 1 + text format for the whole column, matching
-            # notebook lines 851-852.
-            sheet.Cells(1, step.match_key_column).Value = step.match_key_header
-            excel_ops.set_column_format_text(sheet, f"{mk_letter}:{mk_letter}")
-            # Notebook line 863 writes the composite key to P for every row
-            # in the loop (including skip rows, which get "NOTFOUND|..." or
-            # "|" written). Match that by writing excel_keys[i] for every
-            # row 2..last_row.
-            mk_range = f"{mk_letter}2:{mk_letter}{last_row}"
-            mk_data = [[k] for k in excel_keys]
-            excel_ops.write_range_2d(sheet, mk_range, mk_data)
-
-    sub_progress(7)
+    # --- 6. Publish outputs for downstream steps (Gen 4) -----------------
+    # Later steps key off these values from memory instead of re-reading an
+    # Excel write-back. Only main-block outputs are published -- no current
+    # workflow keys off an extras column (extras also depend on EXISTING
+    # cell content, which only the write-back phase reads).
+    for j, sap_c in enumerate(step.sap_output_columns):
+        col_values = []
+        for entry in entries_by_row:
+            v = entry[sap_c] if entry is not None else ""
+            col_values.append("" if v is None else v)
+        vsheet.publish(step.excel_output_columns[j], col_values)
 
     non_skip = n_rows - n_skipped
     unmatched = non_skip - matched
@@ -718,12 +716,165 @@ def _run_step(
              f"error screen, (b) the ALV filter rejected the values, (c) plant "
              f"or table wrong for this environment.", "warn")
     _log(on_event,
-         f"Step {step_index + 1} finished in {time.time() - step_started:.1f}s: "
+         f"Step {step_index + 1} fetched in {time.time() - step_started:.1f}s: "
          f"{matched}/{non_skip} rows matched, {unmatched} unmatched"
-         + (f", {n_skipped} skipped" if n_skipped else ""),
+         + (f", {n_skipped} skipped" if n_skipped else "")
+         + " (write deferred to final pass)",
          "ok")
-    _progress(on_event, (step_index + 1) / total_steps)
-    return matched, unmatched
+    _progress(on_event, (step_index + 1) / n_segments)
+    return StepResult(
+        step=step,
+        step_index=step_index,
+        last_row=last_row,
+        excel_keys=excel_keys,
+        entries_by_row=entries_by_row,
+        n_skipped=n_skipped,
+        matched=matched,
+        unmatched=unmatched,
+    )
+
+
+def _write_back(
+    results: list[StepResult],
+    xl: excel_ops.ExcelCtx,
+    on_event: EventFn,
+    total_steps: int,
+) -> None:
+    """Apply every fetched step's writes to the workbook in ONE pass.
+
+    Gen 4: nothing reaches the workbook unless every step fetched
+    successfully -- a SAP failure or user Stop during the fetch phase leaves
+    the file completely untouched. Per-step write semantics (clear-to-bottom,
+    text formats, extras preserve/clear rules, audit match-key column) are
+    unchanged from Gen 2/3; only WHEN they run has moved. Step column sets
+    are disjoint in both workflows, so applying them sequentially here is
+    identical to the old interleaved order.
+    """
+    n_segments = total_steps + 1
+    _status(on_event, "writing all step results to Excel (single pass)")
+    sheet = xl.sheet
+    rows_count = int(sheet.Rows.Count)
+
+    with excel_ops.bulk_write(xl.app):
+        for done, res in enumerate(results):
+            step = res.step
+            last_row = res.last_row
+            excel_keys = res.excel_keys
+            entries_by_row = res.entries_by_row
+            n_rows = len(excel_keys)
+
+            # -------- Main output block ---------------------------------
+            oc_min = min(step.excel_output_columns)
+            oc_max = max(step.excel_output_columns)
+            oc_span = oc_max - oc_min + 1
+            target_write = _range(oc_min, oc_max, 2, last_row)
+            # Match notebook: clear the ENTIRE column range down to
+            # Rows.Count so stale rows below last_row (from a prior, longer
+            # run) are wiped.
+            target_clear = _range(oc_min, oc_max, 2, rows_count)
+
+            main_out: list[list] = []
+            for i in range(n_rows):
+                entry = entries_by_row[i]
+                row_vals = ["" for _ in range(oc_span)]
+                if entry is not None:
+                    for j, sap_c in enumerate(step.sap_output_columns):
+                        excel_c = step.excel_output_columns[j]
+                        offset = excel_c - oc_min
+                        val = entry[sap_c]
+                        row_vals[offset] = "" if val is None else val
+                main_out.append(row_vals)
+
+            excel_ops.clear_range(sheet, target_clear)
+            excel_ops.set_column_format_text(
+                sheet, f"{_col_letter(oc_min)}:{_col_letter(oc_max)}"
+            )
+            excel_ops.write_range_2d(sheet, target_write, main_out)
+
+            # -------- Extras (per-column, with per-column semantics) ----
+            for extra in step.extras:
+                letter = _col_letter(extra.excel_col)
+                xrange = f"{letter}2:{letter}{last_row}"
+
+                # Read existing only when at least one row will preserve it.
+                # Safe to read here (not in the fetch phase): no step writes
+                # another step's extras column, so the pre-run content is
+                # still intact at this point.
+                need_existing = extra.preserve_on_nonmatch or extra.sap_col is None
+                existing_extra = (
+                    excel_ops.read_range_2d(sheet, xrange) if need_existing else None
+                )
+
+                col_data: list[list] = []
+                for i in range(n_rows):
+                    existing_val = (
+                        existing_extra[i][0]
+                        if (existing_extra and i < len(existing_extra)
+                            and existing_extra[i])
+                        else ""
+                    )
+                    entry = entries_by_row[i]
+                    if entry is not None:
+                        # Matched row.
+                        if extra.sap_col is None:
+                            # No SAP source -> preserve on match
+                            # (mirrors notebook TO-3 col J behavior).
+                            col_data.append([existing_val])
+                        else:
+                            v = entry[extra.sap_col]
+                            col_data.append(["" if v is None else v])
+                    else:
+                        # Non-match OR skip (treated the same, per notebook).
+                        if extra.preserve_on_nonmatch:
+                            col_data.append([existing_val])
+                        else:
+                            col_data.append([""])
+
+                # Only set text format on columns where we're writing SAP
+                # data; a preserve-only column (sap_col=None) should keep
+                # whatever NumberFormat the user had -- notebook doesn't
+                # touch it.
+                if extra.sap_col is not None:
+                    excel_ops.set_column_format_text(sheet, f"{letter}:{letter}")
+                excel_ops.write_range_2d(sheet, xrange, col_data)
+
+            # -------- Match key column (P for TO-2) ----------------------
+            if step.match_key_column is not None:
+                mk_letter = _col_letter(step.match_key_column)
+                # Header at row 1 + text format for the whole column,
+                # matching notebook lines 851-852.
+                sheet.Cells(1, step.match_key_column).Value = step.match_key_header
+                excel_ops.set_column_format_text(sheet, f"{mk_letter}:{mk_letter}")
+                # Notebook line 863 writes the composite key to P for every
+                # row in the loop (including skip rows, which get
+                # "NOTFOUND|..." or "|" written). Match that by writing
+                # excel_keys[i] for every row 2..last_row.
+                mk_range = f"{mk_letter}2:{mk_letter}{last_row}"
+                mk_data = [[k] for k in excel_keys]
+                excel_ops.write_range_2d(sheet, mk_range, mk_data)
+
+            _progress(
+                on_event,
+                (total_steps + (done + 1) / max(1, len(results))) / n_segments,
+            )
+
+    _log(on_event,
+         f"write-back complete: {len(results)} step block(s) written in one pass",
+         "ok")
+
+
+def _log_write_state(on_event: EventFn, write_state: str) -> None:
+    """After a cancel/failure, tell the user exactly what state the file is
+    in. Gen 4 defers all writes, so the common case is 'untouched'."""
+    if write_state == "none":
+        _log(on_event,
+             "the workbook was NOT modified (all writes are deferred until "
+             "every SAP step succeeds)", "info")
+    elif write_state == "partial":
+        _log(on_event,
+             "WARNING: failure happened DURING the final write-back -- the "
+             "workbook may be partially updated and has not been saved. "
+             "Review it before saving manually.", "warn")
 
 
 @dataclass
@@ -743,6 +894,10 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     pythoncom.CoInitialize()
     run_started = time.time()
     log_path = _open_run_log()
+    # Gen 4 write state, used by the error/cancel handlers to tell the user
+    # exactly what happened to the file: "none" -> nothing written (fetch
+    # phase), "partial" -> failure mid write-back, "done" -> fully written.
+    write_state = "none"
     try:
         _log(on_event, f"esa-lookup starting workflow '{cfg.workflow}'", "info")
         if log_path:
@@ -787,18 +942,35 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
              f"step 1 will process rows 2..{primary_last} (column "
              f"{_col_letter(primary_col)}); each subsequent step derives "
              f"its own row range from its own key column")
+        _log(on_event,
+             "Gen 4: steps chain in memory; the workbook is written once, "
+             "after every SAP step has succeeded")
 
+        # ---- Phase 1: fetch every step from SAP (no workbook writes) ----
+        vsheet = VirtualSheet(xl.sheet)
+        results: list[StepResult] = []
         totals_matched = 0
         totals_seen = 0
         for i, step in enumerate(steps):
             if cfg.stop_event.is_set():
                 raise Cancelled()
-            m, u = _run_step(
-                step, xl, sap, tmp_dir, on_event, i, total_steps,
+            res = _fetch_step(
+                step, vsheet, xl, sap, tmp_dir, on_event, i, total_steps,
                 cfg.stop_event,
             )
-            totals_matched += m
-            totals_seen += m + u
+            if res is None:
+                continue  # no-op step (empty key column)
+            results.append(res)
+            totals_matched += res.matched
+            totals_seen += res.matched + res.unmatched
+
+        if cfg.stop_event.is_set():
+            raise Cancelled()
+
+        # ---- Phase 2: single write-back pass + save ---------------------
+        write_state = "partial"
+        _write_back(results, xl, on_event, total_steps)
+        write_state = "done"
 
         # Fix L: save() now raises ExcelError on failure; warn the user
         # rather than silently pretending the write persisted.
@@ -815,18 +987,21 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
 
     except Cancelled:
         _log(on_event, "cancelled by user", "warn")
+        _log_write_state(on_event, write_state)
         _status(on_event, "cancelled")
         on_event("done", False)
         return False
     except sap_ops.SapError as e:
         _log(on_event, f"SAP error: {e}", "error")
         _file_log_traceback()  # full chain into the log file for post-mortem
+        _log_write_state(on_event, write_state)
         _status(on_event, "SAP error")
         on_event("done", False)
         return False
     except excel_ops.ExcelError as e:
         _log(on_event, f"Excel error: {e}", "error")
         _file_log_traceback()
+        _log_write_state(on_event, write_state)
         _status(on_event, "Excel error")
         on_event("done", False)
         return False
@@ -834,6 +1009,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"unexpected error: {e}", "error")
         _log(on_event, traceback.format_exc(), "error")
         _file_log_traceback()
+        _log_write_state(on_event, write_state)
         _status(on_event, "failed")
         on_event("done", False)
         return False

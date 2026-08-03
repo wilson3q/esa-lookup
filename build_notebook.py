@@ -272,8 +272,12 @@ retained).
     md("""\
 ## Pipeline core *(inlined from `pipeline.py`)*
 
-Key normalization, workflow definitions, per-step orchestrator, and the
-per-run file-log subsystem. All 10 notebook-parity fixes present.
+Key normalization, workflow definitions, orchestrator, and the per-run
+file-log subsystem. All 10 notebook-parity fixes present.
+
+**Gen 4:** steps chain in memory (`VirtualSheet`) and the workbook is
+written once, in a single final pass -- a SAP failure or Stop leaves the
+file untouched.
 """),
     code(rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))),
 
