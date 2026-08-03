@@ -105,6 +105,16 @@ def paste_multi_value_filter(
         log(f"SAP: pasting {len(values)} filter values via clipboard")
     s.find(push_button_id).press()
     time.sleep(0.3)
+    # Item 2: clear values retained from a previous chunk/run first -- SAP
+    # keeps the selection dialog's contents within a session, and the
+    # clipboard upload can append rather than replace. Deleting everything
+    # up front makes the paste deterministic. btn[16] = "Delete Entire
+    # Selection" on the standard multi-select dialog toolbar.
+    try:
+        s.find("wnd[1]/tbar[0]/btn[16]").press()
+        time.sleep(0.2)
+    except Exception:
+        pass  # button absent on this SAP GUI version -- old behavior
     # In the multi-value dialog: btn[24] = Upload from Clipboard, btn[8] = OK
     s.find("wnd[1]/tbar[0]/btn[24]").press()
     time.sleep(0.3)
@@ -118,6 +128,46 @@ def execute_query(s: SapSession, log=None) -> None:
         log("SAP: executing query (F8)")
     s.find("wnd[0]/tbar[1]/btn[8]").press()
     time.sleep(0.5)
+
+
+def read_statusbar(s: SapSession) -> tuple[str, str]:
+    """Return (message_type, text) from the main window's status bar.
+
+    message_type is one of '' / 'S' (success) / 'W' (warning) / 'E' (error)
+    / 'A' (abort) / 'I' (info). Returns ('', '') when the bar is empty or
+    unreadable -- callers must treat that as "no message", not success.
+    """
+    try:
+        sbar = s.find("wnd[0]/sbar")
+        return (str(sbar.MessageType or "").strip().upper(),
+                str(sbar.Text or "").strip())
+    except Exception:
+        return "", ""
+
+
+def query_result_check(s: SapSession, log=None) -> int:
+    """Item 2: after F8, confirm a result grid exists and return its row
+    count (0 = query ran but matched nothing).
+
+    Reads the status bar first: an 'E' (error) or 'A' (abort) message, or a
+    missing result grid, raises SapError carrying SAP's own message -- so a
+    bad query fails HERE with a precise reason instead of two calls later
+    as a confusing export failure. Non-fatal messages are just logged.
+    """
+    msg_type, msg_text = read_statusbar(s)
+    if msg_text and log:
+        log(f"SAP status bar: [{msg_type or ' '}] {msg_text}")
+    if msg_type in ("E", "A"):
+        raise SapError(f"SAP reported an error after executing the query: {msg_text}")
+    try:
+        grid = s.find("wnd[0]/shellcont/shell")
+        return int(grid.RowCount)
+    except Exception as e:
+        raise SapError(
+            "No result grid appeared after executing the query"
+            + (f" -- SAP said: {msg_text!r}" if msg_text else "")
+            + ". Check the filter values, table name, and plant."
+        ) from e
 
 
 def export_alv_to_file(

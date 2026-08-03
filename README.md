@@ -16,6 +16,14 @@ fetched, not off column C in the sheet); the workbook is then written
   a write+re-read round-trip between every step.
 - Output columns, matching rules, and preserve/clear semantics are
   unchanged from the previous version.
+- SAP steps are self-checking: the status bar is read after every query
+  (SAP errors surface with SAP's own message), export row counts are
+  verified against the grid (a truncated export aborts the run instead of
+  silently under-matching), an empty result is a clean "all unmatched"
+  outcome, and key lists larger than 2000 are split into multiple
+  query+export rounds automatically. The multi-select dialog is also
+  cleared before each paste, so values left over from a previous run can
+  no longer leak into the filter.
 
 ## Prerequisites
 

@@ -50,6 +50,12 @@ _SCI_NOTATION_RE = re.compile(r"^-?\d+(\.\d+)?[eE][+-]?\d+$")
 # skip rows are treated as non-matches for the write path, not preserved.
 _SKIP_KEY_MARKERS = frozenset({"NOT FOUND", "NOTFOUND"})
 
+# Item 2: maximum filter values pasted into one SAP query. Larger key lists
+# are split into multiple navigate->paste->execute->export rounds and the
+# exports concatenated before matching. 2000 keeps the multi-select dialog
+# and the ALV export comfortably inside SAP's practical limits.
+SAP_FILTER_CHUNK_SIZE = 2000
+
 
 def _clean_cell(value) -> str:
     """Turn a raw Excel/pandas value into a stripped string, treating None,
@@ -618,53 +624,101 @@ def _fetch_step(
     _log(on_event, f"{len(unique_paste_values)} unique key(s) will be sent to SAP")
     sub_progress(2)
 
-    # --- 2. Stage clipboard, navigate SAP, paste filter, execute ---------
-    scratch = excel_ops.stage_values_on_clipboard(xl.app, unique_paste_values)
-    try:
-        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}")
-        sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
-        sub_progress(3)
+    # --- 2. Query SAP in chunks: navigate, paste, execute, verify, export
+    # Item 2: large key lists are split so a single oversized multi-select
+    # paste can't overload the selection screen or produce an unmanageable
+    # export. Each chunk is a full navigate->paste->execute->export round;
+    # chunk results are concatenated before matching.
+    chunks = [
+        unique_paste_values[i:i + SAP_FILTER_CHUNK_SIZE]
+        for i in range(0, len(unique_paste_values), SAP_FILTER_CHUNK_SIZE)
+    ]
+    if len(chunks) > 1:
+        _log(on_event,
+             f"splitting {len(unique_paste_values)} key(s) into {len(chunks)} "
+             f"chunk(s) of <= {SAP_FILTER_CHUNK_SIZE}")
 
-        push_id = sap_ops.PUSH_BUTTONS[(step.sap_table, step.push_button_field)]
-        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: pasting {len(unique_paste_values)} filter values")
-        sap_ops.paste_multi_value_filter(sap, push_id, unique_paste_values, log=lambda m: _log(on_event, m))
-        sub_progress(4)
-
-        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: executing query")
-        sap_ops.execute_query(sap, log=lambda m: _log(on_event, m))
-        sub_progress(5)
-    finally:
-        excel_ops.close_scratch(scratch)
-
-    if stop.is_set():
-        raise Cancelled()
-
-    # --- 3. Export ALV grid to a file -----------------------------------
-    _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: exporting ALV grid")
+    push_id = sap_ops.PUSH_BUTTONS[(step.sap_table, step.push_button_field)]
+    frames: list[pd.DataFrame] = []
     ts = int(time.time())
-    export_name = f"{step.sap_table}_{step.push_button_field}_{ts}.xlsx"
-    export_start = time.time()
-    export_path = sap_ops.export_alv_to_file(
-        sap, tmp_dir, export_name, log=lambda m: _log(on_event, m)
-    )
-    try:
-        size_kb = os.path.getsize(export_path) / 1024.0
-    except OSError:
-        size_kb = 0.0
-    _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
-                    f"({size_kb:.0f} KB)")
-    sub_progress(6)
+    for ci, chunk in enumerate(chunks):
+        if stop.is_set():
+            raise Cancelled()
+        tag = f" (chunk {ci + 1}/{len(chunks)})" if len(chunks) > 1 else ""
 
-    # --- 4. Load export, build lookup dict ------------------------------
+        scratch = excel_ops.stage_values_on_clipboard(xl.app, chunk)
+        try:
+            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}{tag}")
+            sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
+            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: pasting {len(chunk)} filter values{tag}")
+            sap_ops.paste_multi_value_filter(sap, push_id, chunk, log=lambda m: _log(on_event, m))
+            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: executing query{tag}")
+            sap_ops.execute_query(sap, log=lambda m: _log(on_event, m))
+        finally:
+            excel_ops.close_scratch(scratch)
+
+        # Item 2: read the status bar + confirm a result grid exists. An SAP
+        # error message or missing grid fails HERE with SAP's own words
+        # instead of a confusing export failure two calls later.
+        grid_rows = sap_ops.query_result_check(sap, log=lambda m: _log(on_event, m))
+        if grid_rows == 0:
+            _log(on_event, f"SAP returned 0 rows{tag}; nothing to export", "warn")
+            sub_progress(2 + 4 * (ci + 1) / len(chunks))
+            continue
+
+        _status(on_event,
+                f"[{step_index + 1}/{total_steps}] SAP: exporting ALV grid "
+                f"({grid_rows} rows){tag}")
+        export_name = f"{step.sap_table}_{step.push_button_field}_{ts}_{ci}.xlsx"
+        export_start = time.time()
+        export_path = sap_ops.export_alv_to_file(
+            sap, tmp_dir, export_name, log=lambda m: _log(on_event, m)
+        )
+        try:
+            size_kb = os.path.getsize(export_path) / 1024.0
+        except OSError:
+            size_kb = 0.0
+        _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
+                        f"({size_kb:.0f} KB)")
+
+        df_chunk = pd.read_excel(export_path)
+        # Item 2: verify the file matches what the grid showed. Fewer rows
+        # than the grid = truncated export = silent data loss downstream.
+        if len(df_chunk) < grid_rows:
+            raise RuntimeError(
+                f"Export row-count mismatch{tag}: the SAP grid shows "
+                f"{grid_rows} row(s) but the export file contains "
+                f"{len(df_chunk)} -- the export is incomplete. Re-run; if it "
+                f"persists, export once manually from ZTBV and compare with "
+                f"{export_path}.")
+        if len(df_chunk) > grid_rows:
+            _log(on_event,
+                 f"note: export has {len(df_chunk)} row(s) vs {grid_rows} in "
+                 f"the grid (totals/subtotal lines?); harmless unless the "
+                 f"extra rows carry key values", "warn")
+        frames.append(df_chunk)
+        sub_progress(2 + 4 * (ci + 1) / len(chunks))
+
+    # --- 3. Combine chunk results, build lookup dict ---------------------
     _status(on_event, f"[{step_index + 1}/{total_steps}] loading SAP export")
-    df = pd.read_excel(export_path)
-    _log(on_event, f"SAP returned {len(df)} row(s) with columns {list(df.columns)[:8]}{'...' if len(df.columns) > 8 else ''}")
     extra_sap_cols = [e.sap_col for e in step.extras if e.sap_col]
-    lookup, dup_count, blank_key_count = _build_lookup(
-        df,
-        step.sap_key_columns,
-        step.sap_output_columns + extra_sap_cols,
-    )
+    if not frames:
+        # Every chunk came back empty: a legitimate "no matches" outcome.
+        # (Previously this crashed in _build_lookup with a missing-columns
+        # error, because the export of an empty grid carries no data.)
+        _log(on_event,
+             "SAP returned no rows for any of the requested keys -- every "
+             "row will be treated as unmatched", "warn")
+        df = None
+        lookup, dup_count, blank_key_count = {}, 0, 0
+    else:
+        df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+        _log(on_event, f"SAP returned {len(df)} row(s) with columns {list(df.columns)[:8]}{'...' if len(df.columns) > 8 else ''}")
+        lookup, dup_count, blank_key_count = _build_lookup(
+            df,
+            step.sap_key_columns,
+            step.sap_output_columns + extra_sap_cols,
+        )
     if dup_count:
         _log(on_event,
              f"WARNING: SAP returned {dup_count} duplicate key(s); only the "
