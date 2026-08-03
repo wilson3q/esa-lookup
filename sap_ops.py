@@ -105,11 +105,85 @@ def paste_multi_value_filter(
         log(f"SAP: pasting {len(values)} filter values via clipboard")
     s.find(push_button_id).press()
     time.sleep(0.3)
+    # Item 2: clear values retained from a previous chunk/run first -- SAP
+    # keeps the selection dialog's contents within a session, and the
+    # clipboard upload can append rather than replace. Deleting everything
+    # up front makes the paste deterministic. btn[16] = "Delete Entire
+    # Selection" on the standard multi-select dialog toolbar.
+    try:
+        s.find("wnd[1]/tbar[0]/btn[16]").press()
+        time.sleep(0.2)
+    except Exception:
+        pass  # button absent on this SAP GUI version -- old behavior
     # In the multi-value dialog: btn[24] = Upload from Clipboard, btn[8] = OK
     s.find("wnd[1]/tbar[0]/btn[24]").press()
     time.sleep(0.3)
     s.find("wnd[1]/tbar[0]/btn[8]").press()
     time.sleep(0.2)
+
+
+def fill_multi_value_filter_from_file(
+    s: SapSession, push_button_id: str, values: list[str], work_dir: str,
+    log=None,
+) -> None:
+    """Item 3: feed the multi-select filter from a temp TEXT FILE instead of
+    the OS clipboard.
+
+    The clipboard is global state -- a user copying anything while a run is
+    in flight silently replaces the filter values (wrong results, not a
+    crash). The multi-select dialog's 'Import from Text File' button
+    (btn[23]) reads from a file only we control.
+
+    Requires 'Show native Microsoft Windows dialogs' = Off (README end-user
+    setup) so the file-open dialog is the scriptable SAP one (same
+    DY_PATH / DY_FILENAME layout as the ALV export save dialog). Raises
+    SapError on any failure -- after closing the dialogs it opened -- so
+    the caller can fall back to the clipboard path.
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    filename = "esa_lookup_filter.txt"
+    path = os.path.join(work_dir, filename)
+    # One value per line, CRLF. SAP keys are plain ASCII; anything else
+    # fails fast here and the caller drops to the clipboard path.
+    try:
+        with open(path, "w", encoding="ascii", newline="") as f:
+            f.write("\r\n".join(str(v) for v in values))
+            f.write("\r\n")
+    except (OSError, UnicodeEncodeError) as e:
+        raise SapError(f"cannot write filter file {path}: {e}") from e
+
+    if log:
+        log(f"SAP: importing {len(values)} filter values from file")
+    s.find(push_button_id).press()
+    time.sleep(0.3)
+    try:
+        # Clear leftover values first (same rationale as the clipboard
+        # path: the dialog retains contents within a session).
+        try:
+            s.find("wnd[1]/tbar[0]/btn[16]").press()  # Delete Entire Selection
+            time.sleep(0.2)
+        except Exception:
+            pass
+        s.find("wnd[1]/tbar[0]/btn[23]").press()      # Import from Text File
+        time.sleep(0.4)
+        s.find("wnd[2]/usr/ctxtDY_PATH").Text = work_dir
+        s.find("wnd[2]/usr/ctxtDY_FILENAME").Text = filename
+        s.find("wnd[2]/tbar[0]/btn[0]").press()       # Open / OK
+        time.sleep(0.3)
+        s.find("wnd[1]/tbar[0]/btn[8]").press()       # Copy -> selection screen
+        time.sleep(0.2)
+    except Exception as e:
+        # Leave the screen usable for the clipboard fallback: close the
+        # file dialog and the multi-select dialog if still open.
+        for wid in ("wnd[2]", "wnd[1]"):
+            try:
+                s.find(wid).close()
+            except Exception:
+                pass
+        raise SapError(
+            f"file import into the multi-select dialog failed: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 def execute_query(s: SapSession, log=None) -> None:
@@ -118,6 +192,46 @@ def execute_query(s: SapSession, log=None) -> None:
         log("SAP: executing query (F8)")
     s.find("wnd[0]/tbar[1]/btn[8]").press()
     time.sleep(0.5)
+
+
+def read_statusbar(s: SapSession) -> tuple[str, str]:
+    """Return (message_type, text) from the main window's status bar.
+
+    message_type is one of '' / 'S' (success) / 'W' (warning) / 'E' (error)
+    / 'A' (abort) / 'I' (info). Returns ('', '') when the bar is empty or
+    unreadable -- callers must treat that as "no message", not success.
+    """
+    try:
+        sbar = s.find("wnd[0]/sbar")
+        return (str(sbar.MessageType or "").strip().upper(),
+                str(sbar.Text or "").strip())
+    except Exception:
+        return "", ""
+
+
+def query_result_check(s: SapSession, log=None) -> int:
+    """Item 2: after F8, confirm a result grid exists and return its row
+    count (0 = query ran but matched nothing).
+
+    Reads the status bar first: an 'E' (error) or 'A' (abort) message, or a
+    missing result grid, raises SapError carrying SAP's own message -- so a
+    bad query fails HERE with a precise reason instead of two calls later
+    as a confusing export failure. Non-fatal messages are just logged.
+    """
+    msg_type, msg_text = read_statusbar(s)
+    if msg_text and log:
+        log(f"SAP status bar: [{msg_type or ' '}] {msg_text}")
+    if msg_type in ("E", "A"):
+        raise SapError(f"SAP reported an error after executing the query: {msg_text}")
+    try:
+        grid = s.find("wnd[0]/shellcont/shell")
+        return int(grid.RowCount)
+    except Exception as e:
+        raise SapError(
+            "No result grid appeared after executing the query"
+            + (f" -- SAP said: {msg_text!r}" if msg_text else "")
+            + ". Check the filter values, table name, and plant."
+        ) from e
 
 
 def export_alv_to_file(

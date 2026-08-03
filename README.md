@@ -3,6 +3,38 @@
 Windows GUI app that mass-looks-up SAP data into an Excel file. Replaces the
 per-cell notebook workflow with ALV grid exports + bulk Excel writes.
 
+## Gen 4 (this branch): in-memory chaining, single write pass
+
+Steps no longer write to Excel one-by-one. All SAP lookups run first and
+chain **in memory** (e.g. TO step 3 keys off the OBJNR values step 2 just
+fetched, not off column C in the sheet); the workbook is then written
+**once**, at the end. Consequences:
+
+- A failure or Stop during the SAP phase leaves the workbook **completely
+  untouched** -- no more partially-updated files.
+- Large runs are faster: 1 bulk key-read + 1 bulk write total instead of
+  a write+re-read round-trip between every step.
+- Output columns, matching rules, and preserve/clear semantics are
+  unchanged from the previous version.
+- SAP steps are self-checking: the status bar is read after every query
+  (SAP errors surface with SAP's own message), export row counts are
+  verified against the grid (a truncated export aborts the run instead of
+  silently under-matching), an empty result is a clean "all unmatched"
+  outcome, and key lists larger than 2000 are split into multiple
+  query+export rounds automatically. The multi-select dialog is also
+  cleared before each paste, so values left over from a previous run can
+  no longer leak into the filter.
+- Filter values now reach SAP through a **temp text file** ('Import from
+  Text File' in the multi-select dialog) instead of the OS clipboard --
+  copying something to the clipboard while a run is in flight can no
+  longer corrupt the filter. If the import dialog is not scriptable on a
+  given SAP GUI version, the app logs a warning and automatically falls
+  back to the old clipboard paste.
+- **Dry run mode** (checkbox in the GUI, `DRY_RUN = True` in the
+  notebook): runs every SAP lookup and reports match counts + sample rows
+  in the log, but leaves the workbook completely untouched. Use it to
+  sanity-check a new file or ALV layout before writing anything.
+
 ## Prerequisites
 
 - Windows with **SAP GUI for Windows** installed (Java client is not supported)
@@ -31,7 +63,8 @@ pip install -r requirements.txt
    python esa_lookup.py
    ```
 4. Browse to the Excel file, pick either the **TO Number process** or
-   **Notification Number process**, click **Run**
+   **Notification Number process**, click **Run** (tick **Dry run** first
+   if you only want a match report without writing anything)
 
 ## Workflows
 
@@ -68,6 +101,12 @@ exported file.
   the Save-As dialog vary slightly between SAP GUI versions. Record a
   single export via SAP GUI Script Recorder and adjust `EXPORT_SEQUENCES`
   in `sap_ops.py`.
+- **"file import unavailable ... falling back to clipboard paste"** - the
+  multi-select dialog's Import-from-Text-File path could not be scripted
+  (older SAP GUI, or 'Show native Microsoft Windows dialogs' is On). The
+  run still works via the clipboard; to fix the import path, check that
+  native dialogs are Off, or record the import once with the Script
+  Recorder and adjust `fill_multi_value_filter_from_file` in `sap_ops.py`.
 - **Fewer matches than expected** - your ALV layout is probably missing a
   key column; edit and re-save the layout, then re-run.
 - **"WARNING: sent N unique key(s) to SAP but only M matched"** - shown
@@ -266,6 +305,22 @@ are currently running.
   If IT quarantines it, sign the exe with `signtool` before distribution
   or request an AV exception on the download location.
 
+## Tests
+
+The test suite stubs the COM boundary (win32com / pythoncom), so it runs
+on **any OS** -- no SAP GUI, no Excel, no Windows required:
+
+```
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Covered: key normalization + lookup building (`tests/test_keys.py`), the
+Gen 4 in-memory column resolver (`tests/test_virtual_sheet.py`), and both
+workflows end-to-end against a fake SAP/Excel -- including failure
+atomicity, chunking, 0-row results, truncated exports, the clipboard
+fallback, and dry run (`tests/test_workflow_e2e.py`).
+
 ## Files
 
 - `esa_lookup.py` - tkinter GUI entry point
@@ -273,3 +328,4 @@ are currently running.
 - `excel_ops.py`  - Excel COM helpers (bulk read/write)
 - `pipeline.py`   - workflow orchestrator + key-normalization helpers
 - `build.ps1`     - build a standalone `dist\esa-lookup.exe`
+- `tests/`        - COM-stubbed pytest suite (runs anywhere)

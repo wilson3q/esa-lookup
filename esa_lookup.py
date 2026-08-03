@@ -72,6 +72,12 @@ def apply_dark_theme(root: tk.Tk) -> ttk.Style:
               background=[("active", BG)],
               indicatorcolor=[("selected", ACCENT), ("!selected", INPUT_BRD)])
 
+    style.configure("TCheckbutton", background=BG, foreground=FG,
+                    focuscolor=BG, indicatorcolor=INPUT)
+    style.map("TCheckbutton",
+              background=[("active", BG)],
+              indicatorcolor=[("selected", ACCENT), ("!selected", INPUT_BRD)])
+
     style.configure("TLabelframe", background=BG, foreground=MUTED, bordercolor=INPUT_BRD)
     style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
 
@@ -103,6 +109,7 @@ class App:
 
         self.file_var = tk.StringVar()
         self.workflow_var = tk.StringVar(value="TO")
+        self.dryrun_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._drain_queue()
@@ -127,8 +134,9 @@ class App:
             "   5.  Click 'Run'.  Do NOT close SAP GUI or Excel while it runs -\n"
             "        the app is driving both windows for you.\n"
             "\n"
-            "Watch Status / Progress / Log while it works.  Click 'Stop' to cancel\n"
-            "after the current step.  When done, the Excel file is filled in + saved."
+            "Watch Status / Progress / Log while it works.  Click 'Stop' to cancel -\n"
+            "nothing is written to the Excel file unless every SAP step succeeds.\n"
+            "When done, the file is filled in via one final write pass + saved."
         )
         ttk.Label(
             instr, text=instructions_text, style="Hint.TLabel",
@@ -173,6 +181,10 @@ class App:
         self.run_btn.pack(side="left", padx=(8, 0))
         self.stop_btn = ttk.Button(row3, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            row3, text="Dry run (report matches only, write nothing)",
+            variable=self.dryrun_var,
+        ).pack(side="left", padx=(12, 0))
         ttk.Label(
             row3, style="Hint.TLabel",
             text="   Keep this window, SAP GUI, and Excel all visible while it runs.",
@@ -235,6 +247,7 @@ class App:
             excel_path=path,
             workflow=self.workflow_var.get(),
             stop_event=self.stop_event,
+            dry_run=self.dryrun_var.get(),
         )
         self._set_running(True)
         self.status_var.set("starting...")
@@ -249,7 +262,9 @@ class App:
     def _on_stop(self) -> None:
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
-            self._append_log("Stop requested -- will halt after the current step.", "warn")
+            self._append_log(
+                "Stop requested -- will halt after the current SAP step; "
+                "the Excel file will not be modified.", "warn")
 
     # -- worker <-> UI plumbing --------------------------------------------
 
