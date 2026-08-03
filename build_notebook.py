@@ -163,6 +163,8 @@ def print_event(kind: str, payload) -> None:
 CONFIG_CELL = """\
 # ---- EDIT THIS -----------------------------------------------------------
 WORKFLOW = "TO"   # "TO" or "NOTIF"
+DRY_RUN = False   # True = run all SAP lookups + report match counts, but
+                  # leave the workbook completely untouched
 # --------------------------------------------------------------------------
 
 # Native file-picker (same widget the .py GUI uses, via tkinter). Skip
@@ -189,6 +191,7 @@ if WORKFLOW not in ("TO", "NOTIF"):
     raise SystemExit(f"WORKFLOW must be 'TO' or 'NOTIF', got {WORKFLOW!r}")
 
 print(f"Workflow:    {WORKFLOW}")
+print(f"Dry run:     {DRY_RUN}")
 print(f"Excel file:  {EXCEL_PATH}")
 """
 
@@ -197,6 +200,7 @@ cfg = RunConfig(
     excel_path=EXCEL_PATH,
     workflow=WORKFLOW,
     stop_event=threading.Event(),
+    dry_run=DRY_RUN,
 )
 run(cfg, on_event=print_event)
 """

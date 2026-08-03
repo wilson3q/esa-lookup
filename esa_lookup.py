@@ -72,6 +72,12 @@ def apply_dark_theme(root: tk.Tk) -> ttk.Style:
               background=[("active", BG)],
               indicatorcolor=[("selected", ACCENT), ("!selected", INPUT_BRD)])
 
+    style.configure("TCheckbutton", background=BG, foreground=FG,
+                    focuscolor=BG, indicatorcolor=INPUT)
+    style.map("TCheckbutton",
+              background=[("active", BG)],
+              indicatorcolor=[("selected", ACCENT), ("!selected", INPUT_BRD)])
+
     style.configure("TLabelframe", background=BG, foreground=MUTED, bordercolor=INPUT_BRD)
     style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
 
@@ -103,6 +109,7 @@ class App:
 
         self.file_var = tk.StringVar()
         self.workflow_var = tk.StringVar(value="TO")
+        self.dryrun_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._drain_queue()
@@ -174,6 +181,10 @@ class App:
         self.run_btn.pack(side="left", padx=(8, 0))
         self.stop_btn = ttk.Button(row3, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            row3, text="Dry run (report matches only, write nothing)",
+            variable=self.dryrun_var,
+        ).pack(side="left", padx=(12, 0))
         ttk.Label(
             row3, style="Hint.TLabel",
             text="   Keep this window, SAP GUI, and Excel all visible while it runs.",
@@ -236,6 +247,7 @@ class App:
             excel_path=path,
             workflow=self.workflow_var.get(),
             stop_event=self.stop_event,
+            dry_run=self.dryrun_var.get(),
         )
         self._set_running(True)
         self.status_var.set("starting...")

@@ -30,6 +30,10 @@ fetched, not off column C in the sheet); the workbook is then written
   longer corrupt the filter. If the import dialog is not scriptable on a
   given SAP GUI version, the app logs a warning and automatically falls
   back to the old clipboard paste.
+- **Dry run mode** (checkbox in the GUI, `DRY_RUN = True` in the
+  notebook): runs every SAP lookup and reports match counts + sample rows
+  in the log, but leaves the workbook completely untouched. Use it to
+  sanity-check a new file or ALV layout before writing anything.
 
 ## Prerequisites
 
@@ -59,7 +63,8 @@ pip install -r requirements.txt
    python esa_lookup.py
    ```
 4. Browse to the Excel file, pick either the **TO Number process** or
-   **Notification Number process**, click **Run**
+   **Notification Number process**, click **Run** (tick **Dry run** first
+   if you only want a match report without writing anything)
 
 ## Workflows
 
@@ -300,6 +305,22 @@ are currently running.
   If IT quarantines it, sign the exe with `signtool` before distribution
   or request an AV exception on the download location.
 
+## Tests
+
+The test suite stubs the COM boundary (win32com / pythoncom), so it runs
+on **any OS** -- no SAP GUI, no Excel, no Windows required:
+
+```
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Covered: key normalization + lookup building (`tests/test_keys.py`), the
+Gen 4 in-memory column resolver (`tests/test_virtual_sheet.py`), and both
+workflows end-to-end against a fake SAP/Excel -- including failure
+atomicity, chunking, 0-row results, truncated exports, the clipboard
+fallback, and dry run (`tests/test_workflow_e2e.py`).
+
 ## Files
 
 - `esa_lookup.py` - tkinter GUI entry point
@@ -307,3 +328,4 @@ are currently running.
 - `excel_ops.py`  - Excel COM helpers (bulk read/write)
 - `pipeline.py`   - workflow orchestrator + key-normalization helpers
 - `build.ps1`     - build a standalone `dist\esa-lookup.exe`
+- `tests/`        - COM-stubbed pytest suite (runs anywhere)

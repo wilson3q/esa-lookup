@@ -945,11 +945,37 @@ def _log_write_state(on_event: EventFn, write_state: str) -> None:
              "Review it before saving manually.", "warn")
 
 
+def _dry_run_report(results: list[StepResult], on_event: EventFn) -> None:
+    """Item 4: summarize what the write-back WOULD do, without doing it."""
+    _log(on_event, "DRY RUN -- the workbook will not be modified. Planned writes:")
+    for res in results:
+        step = res.step
+        cols = [_col_letter(c) for c in step.excel_output_columns]
+        cols += [_col_letter(e.excel_col) for e in step.extras]
+        if step.match_key_column is not None:
+            cols.append(_col_letter(step.match_key_column))
+        _log(on_event,
+             f"  step {res.step_index + 1} ({step.sap_table}): "
+             f"{res.matched} matched / {res.unmatched} unmatched"
+             + (f" / {res.n_skipped} skipped" if res.n_skipped else "")
+             + f" -> columns {'/'.join(cols)}, rows 2..{res.last_row}")
+        shown = 0
+        for i, entry in enumerate(res.entries_by_row):
+            if entry is None:
+                continue
+            preview = ", ".join(f"{k}={entry[k]}" for k in entry)
+            _log(on_event, f"    e.g. row {i + 2}: {preview}")
+            shown += 1
+            if shown >= 3:
+                break
+
+
 @dataclass
 class RunConfig:
     excel_path: str
     workflow: str            # "TO" or "NOTIF"
     stop_event: threading.Event
+    dry_run: bool = False    # Item 4: fetch + report matches, write nothing
 
 
 def run(cfg: RunConfig, on_event: EventFn) -> bool:
@@ -1034,6 +1060,18 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
 
         if cfg.stop_event.is_set():
             raise Cancelled()
+
+        # ---- Dry run: report what would be written, touch nothing -------
+        if cfg.dry_run:
+            _dry_run_report(results, on_event)
+            _status(on_event, "dry run complete -- nothing written")
+            _log(on_event,
+                 f"DRY RUN complete: {totals_matched}/{totals_seen} "
+                 f"row-matches across {total_steps} step(s); the workbook "
+                 f"was not modified", "ok")
+            _progress(on_event, 1.0)
+            on_event("done", True)
+            return True
 
         # ---- Phase 2: single write-back pass + save ---------------------
         write_state = "partial"
