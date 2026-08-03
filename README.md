@@ -24,6 +24,12 @@ fetched, not off column C in the sheet); the workbook is then written
   query+export rounds automatically. The multi-select dialog is also
   cleared before each paste, so values left over from a previous run can
   no longer leak into the filter.
+- Filter values now reach SAP through a **temp text file** ('Import from
+  Text File' in the multi-select dialog) instead of the OS clipboard --
+  copying something to the clipboard while a run is in flight can no
+  longer corrupt the filter. If the import dialog is not scriptable on a
+  given SAP GUI version, the app logs a warning and automatically falls
+  back to the old clipboard paste.
 
 ## Prerequisites
 
@@ -90,6 +96,12 @@ exported file.
   the Save-As dialog vary slightly between SAP GUI versions. Record a
   single export via SAP GUI Script Recorder and adjust `EXPORT_SEQUENCES`
   in `sap_ops.py`.
+- **"file import unavailable ... falling back to clipboard paste"** - the
+  multi-select dialog's Import-from-Text-File path could not be scripted
+  (older SAP GUI, or 'Show native Microsoft Windows dialogs' is On). The
+  run still works via the clipboard; to fix the import path, check that
+  native dialogs are Off, or record the import once with the Script
+  Recorder and adjust `fill_multi_value_filter_from_file` in `sap_ops.py`.
 - **Fewer matches than expected** - your ALV layout is probably missing a
   key column; edit and re-save the layout, then re-run.
 - **"WARNING: sent N unique key(s) to SAP but only M matched"** - shown

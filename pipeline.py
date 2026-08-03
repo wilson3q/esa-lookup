@@ -646,16 +646,30 @@ def _fetch_step(
             raise Cancelled()
         tag = f" (chunk {ci + 1}/{len(chunks)})" if len(chunks) > 1 else ""
 
-        scratch = excel_ops.stage_values_on_clipboard(xl.app, chunk)
+        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}{tag}")
+        sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
+        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: sending {len(chunk)} filter values{tag}")
         try:
-            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}{tag}")
-            sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
-            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: pasting {len(chunk)} filter values{tag}")
-            sap_ops.paste_multi_value_filter(sap, push_id, chunk, log=lambda m: _log(on_event, m))
-            _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: executing query{tag}")
-            sap_ops.execute_query(sap, log=lambda m: _log(on_event, m))
-        finally:
-            excel_ops.close_scratch(scratch)
+            # Item 3: primary transport is a temp text file ('Import from
+            # Text File' in the multi-select dialog) -- deterministic even
+            # if the user copies something to the clipboard mid-run.
+            sap_ops.fill_multi_value_filter_from_file(
+                sap, push_id, chunk, tmp_dir, log=lambda m: _log(on_event, m))
+        except sap_ops.SapError as e:
+            # Fallback: the Gen 2/3 clipboard path (values staged via an
+            # Excel scratch workbook). Kept for SAP GUI versions where the
+            # import dialog is not scriptable.
+            _log(on_event,
+                 f"file import unavailable ({e}); falling back to "
+                 f"clipboard paste", "warn")
+            scratch = excel_ops.stage_values_on_clipboard(xl.app, chunk)
+            try:
+                sap_ops.paste_multi_value_filter(
+                    sap, push_id, chunk, log=lambda m: _log(on_event, m))
+            finally:
+                excel_ops.close_scratch(scratch)
+        _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: executing query{tag}")
+        sap_ops.execute_query(sap, log=lambda m: _log(on_event, m))
 
         # Item 2: read the status bar + confirm a result grid exists. An SAP
         # error message or missing grid fails HERE with SAP's own words

@@ -122,6 +122,70 @@ def paste_multi_value_filter(
     time.sleep(0.2)
 
 
+def fill_multi_value_filter_from_file(
+    s: SapSession, push_button_id: str, values: list[str], work_dir: str,
+    log=None,
+) -> None:
+    """Item 3: feed the multi-select filter from a temp TEXT FILE instead of
+    the OS clipboard.
+
+    The clipboard is global state -- a user copying anything while a run is
+    in flight silently replaces the filter values (wrong results, not a
+    crash). The multi-select dialog's 'Import from Text File' button
+    (btn[23]) reads from a file only we control.
+
+    Requires 'Show native Microsoft Windows dialogs' = Off (README end-user
+    setup) so the file-open dialog is the scriptable SAP one (same
+    DY_PATH / DY_FILENAME layout as the ALV export save dialog). Raises
+    SapError on any failure -- after closing the dialogs it opened -- so
+    the caller can fall back to the clipboard path.
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    filename = "esa_lookup_filter.txt"
+    path = os.path.join(work_dir, filename)
+    # One value per line, CRLF. SAP keys are plain ASCII; anything else
+    # fails fast here and the caller drops to the clipboard path.
+    try:
+        with open(path, "w", encoding="ascii", newline="") as f:
+            f.write("\r\n".join(str(v) for v in values))
+            f.write("\r\n")
+    except (OSError, UnicodeEncodeError) as e:
+        raise SapError(f"cannot write filter file {path}: {e}") from e
+
+    if log:
+        log(f"SAP: importing {len(values)} filter values from file")
+    s.find(push_button_id).press()
+    time.sleep(0.3)
+    try:
+        # Clear leftover values first (same rationale as the clipboard
+        # path: the dialog retains contents within a session).
+        try:
+            s.find("wnd[1]/tbar[0]/btn[16]").press()  # Delete Entire Selection
+            time.sleep(0.2)
+        except Exception:
+            pass
+        s.find("wnd[1]/tbar[0]/btn[23]").press()      # Import from Text File
+        time.sleep(0.4)
+        s.find("wnd[2]/usr/ctxtDY_PATH").Text = work_dir
+        s.find("wnd[2]/usr/ctxtDY_FILENAME").Text = filename
+        s.find("wnd[2]/tbar[0]/btn[0]").press()       # Open / OK
+        time.sleep(0.3)
+        s.find("wnd[1]/tbar[0]/btn[8]").press()       # Copy -> selection screen
+        time.sleep(0.2)
+    except Exception as e:
+        # Leave the screen usable for the clipboard fallback: close the
+        # file dialog and the multi-select dialog if still open.
+        for wid in ("wnd[2]", "wnd[1]"):
+            try:
+                s.find(wid).close()
+            except Exception:
+                pass
+        raise SapError(
+            f"file import into the multi-select dialog failed: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+
+
 def execute_query(s: SapSession, log=None) -> None:
     """Press F8 on the selection screen to run the query."""
     if log:
