@@ -824,6 +824,31 @@ def _fetch_step(
     # composite key that's not in the SAP result set, including "NOTFOUND|").
     skip_flags = [_is_skip_key_cell(key_vals[primary_col][i]) for i in range(n_rows)]
 
+    # A row whose PRIMARY key cell is filled but whose other key parts are
+    # blank builds a composite like "514368344|" that cannot match anything
+    # SAP returns. It is not a skip (the primary cell has data), so it lands
+    # silently in the "unmatched" bucket and reads as a SAP data problem
+    # rather than a half-filled input row. Name it instead.
+    if len(ordered_cols) > 1:
+        partial = [
+            i for i in range(n_rows)
+            if not skip_flags[i]
+            and normalize_key(key_vals[primary_col][i])
+            and any(not normalize_key(key_vals[c][i]) for c in ordered_cols)
+        ]
+        if partial:
+            blank_cols = sorted({
+                c for c in ordered_cols for i in partial
+                if not normalize_key(key_vals[c][i])
+            })
+            _log(on_event,
+                 f"WARNING: {len(partial)} row(s) have column "
+                 f"{_col_letter(primary_col)} filled but column(s) "
+                 f"{', '.join(_col_letter(c) for c in blank_cols)} blank, so "
+                 f"their composite key is {excel_keys[partial[0]]!r} -- it can "
+                 f"never match a SAP row and will be reported as unmatched. "
+                 f"Fill the missing key column(s) for those rows.", "warn")
+
     unique_paste_values: list[str] = []
     seen: set[str] = set()
     for i in range(n_rows):
