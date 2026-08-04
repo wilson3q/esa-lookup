@@ -385,11 +385,17 @@ SAP_COLUMN_ALIASES: dict[str, list[str]] = {
     # "Unl. Point" is what the ESA ZTBV layout actually prints for ABLAD --
     # the ALV shows English short labels, not technical names.
     "ABLAD":       ["ABLAD", "Unl. Point", "Unloading Point", "UnloadPt"],
-    "QMNUM":       ["QMNUM", "Notification", "Notification No", "Notification Number"],
-    "RSNUM":       ["RSNUM", "Reservation", "Reservation No", "Reservation Number", "Res.Number"],
-    "RSPOS":       ["RSPOS", "Item", "Item No", "Item Number", "Res.Item"],
-    "OBJNR":       ["OBJNR", "Object Number", "Obj.Number", "Object No"],
-    "DISP_MATNR":  ["DISP_MATNR", "Disp Material", "Disposition Material", "Disp.Material"],
+    "QMNUM":       ["QMNUM", "Notifctn", "Notification", "Notification No", "Notification Number"],
+    "RSNUM":       ["RSNUM", "Reserv.No.", "Reservation", "Reservation No", "Reservation Number", "Res.Number"],
+    # ORDER MATTERS. The Z50CFG_ENG_CRNT layout carries BOTH pairs side by
+    # side: 'Reserv.No.' + 'Itm' (the reservation) and 'TO Number' + 'Item'
+    # (the transfer order). RSPOS is the RESERVATION item, so 'Itm' has to
+    # be tried before the generic 'Item' -- otherwise RSPOS silently binds
+    # to the TO item, resolution "succeeds", and step 2 keys on a mismatched
+    # pair that quietly matches nothing.
+    "RSPOS":       ["RSPOS", "Itm", "Res.Item", "Item No", "Item Number", "Item"],
+    "OBJNR":       ["OBJNR", "Object number", "Object Number", "Obj.Number", "Object No"],
+    "DISP_MATNR":  ["DISP_MATNR", "Disp Matl", "Disp Material", "Disposition Material", "Disp.Material"],
     "DISP_QTY":    ["DISP_QTY", "Disp Qty", "Disposition Qty", "Disposition Quantity", "Disp.Qty"],
     "Z_SECTION":   ["Z_SECTION", "Section"],
     "Z_MODULE":    ["Z_MODULE", "Module"],
@@ -647,6 +653,23 @@ def _build_lookup(
             + "\nFix: edit the ALV layout in ZTBV to show 'Technical Name' as "
             "the column title (which is unique per field), or remove the "
             "duplicate columns from the layout and re-save the variant."
+        )
+
+    # Two SAP fields landing on one column means an alias list is too greedy
+    # (the way RSPOS's generic "Item" once outranked the reservation's own
+    # "Itm"). Resolution would "succeed" and the step would then key on a
+    # field it was never meant to read, so refuse rather than guess.
+    collisions: dict[str, list[str]] = {}
+    for c, r in resolved.items():
+        collisions.setdefault(str(r), []).append(c)
+    clashing = {r: cs for r, cs in collisions.items() if len(cs) > 1}
+    if clashing:
+        raise RuntimeError(
+            "These SAP fields all resolved to the SAME export column, so at "
+            "least one of them is bound to the wrong field:\n"
+            + "\n".join(f"  {cs} -> {r!r}" for r, cs in clashing.items())
+            + "\nFix: tighten the alias lists in SAP_COLUMN_ALIASES so each "
+            "field matches its own column title first."
         )
     out: dict[str, dict] = {}
     dup_count = 0

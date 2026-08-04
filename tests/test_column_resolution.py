@@ -8,6 +8,7 @@ the field was right there in the export.
 import pandas as pd
 import pytest
 
+import pipeline
 from pipeline import _build_lookup, _norm_col, _resolve_column
 
 
@@ -67,6 +68,56 @@ class TestResolveColumn:
         assert _resolve_column(pd.DataFrame(columns=["WhN"]), "ABLAD") is None
 
 
+# The real Z50CFG_ENG_CRNT titles from the customer's export (trimmed). It
+# carries BOTH the reservation pair ('Reserv.No.' + 'Itm') and the transfer
+# order pair ('TO Number' + 'Item'), which is what made RSPOS ambiguous.
+ESA_CRNT_TITLES = [
+    "Disposition ID", "Object number", "Disp Matl", "Disp Qty", "Disp Date",
+    "Disp Time", "Batch", "B.Plant", "User", "Prt Status", "Assgn Matl",
+    "Assgn Qty", "Reserv.No.", "Itm", "Unnamed: 15", "Order", "TO Number",
+    "Item", "Unnamed: 19", "Valid", "TCode", "WhN", "Typ", "Pur. Doc.",
+    "Notifctn", "Equipment", "Val. Type", "S", "Serial No.",
+]
+
+
+class TestZ50cfgCrntLabels:
+    """Step 2's table: labels seen for the first time in the [2/3] failure."""
+
+    def _df(self):
+        return pd.DataFrame(columns=ESA_CRNT_TITLES)
+
+    @pytest.mark.parametrize("canonical, expected", [
+        ("RSNUM", "Reserv.No."),
+        ("DISP_MATNR", "Disp Matl"),
+        ("QMNUM", "Notifctn"),
+        ("OBJNR", "Object number"),
+        ("DISP_QTY", "Disp Qty"),
+    ])
+    def test_short_labels_resolve(self, canonical, expected):
+        assert _resolve_column(self._df(), canonical) == expected
+
+    def test_rspos_binds_to_reservation_item_not_to_order_item(self):
+        """The silent-corruption case: both 'Itm' and 'Item' are present.
+
+        RSPOS is the RESERVATION item. Binding it to 'Item' (the transfer
+        order's item, next to 'TO Number') resolves without error and then
+        keys step 2 on a mismatched pair.
+        """
+        assert _resolve_column(self._df(), "RSPOS") == "Itm"
+
+    def test_rspos_still_falls_back_to_item_when_itm_absent(self):
+        df = pd.DataFrame(columns=["Reservation", "Item"])
+        assert _resolve_column(df, "RSPOS") == "Item"
+
+    def test_step2_needed_fields_all_resolve_uniquely(self):
+        """Every field step 2 asks for, against the real titles."""
+        df = self._df()
+        needed = ["RSNUM", "RSPOS", "OBJNR", "DISP_MATNR", "DISP_QTY", "QMNUM"]
+        got = {c: _resolve_column(df, c) for c in needed}
+        assert None not in got.values(), f"unresolved: {got}"
+        assert len(set(got.values())) == len(needed), f"collision: {got}"
+
+
 class TestBuildLookupErrors:
     def test_missing_column_error_suggests_close_titles(self):
         """A label no alias lists yet, close enough to name in the error."""
@@ -88,6 +139,14 @@ class TestBuildLookupErrors:
         """'Item' appears 3x; resolving RSPOS onto it must fail loudly."""
         df = _esa_frame()
         with pytest.raises(RuntimeError, match="more than once"):
+            _build_lookup(df, ["TANUM"], ["RSPOS"])
+
+    def test_two_fields_on_one_column_is_rejected(self, monkeypatch):
+        """Guards the RSPOS-onto-'Item' class of silent mis-binding."""
+        monkeypatch.setitem(pipeline.SAP_COLUMN_ALIASES, "TANUM", ["Item"])
+        monkeypatch.setitem(pipeline.SAP_COLUMN_ALIASES, "RSPOS", ["Item"])
+        df = pd.DataFrame({"Item": ["1"]})
+        with pytest.raises(RuntimeError, match="SAME export column"):
             _build_lookup(df, ["TANUM"], ["RSPOS"])
 
     def test_unambiguous_columns_build_normally(self):
