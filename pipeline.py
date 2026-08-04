@@ -695,7 +695,7 @@ def _fetch_step(
         _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
                         f"({size_kb:.0f} KB)")
 
-        df_chunk = pd.read_excel(export_path)
+        df_chunk = pd.read_excel(export_path, engine="openpyxl")
         # Item 2: verify the file matches what the grid showed. Fewer rows
         # than the grid = truncated export = silent data loss downstream.
         if len(df_chunk) < grid_rows:
