@@ -359,6 +359,43 @@ def _progress(on_event: EventFn, frac: float) -> None:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _read_sap_export(path: str) -> pd.DataFrame:
+    """Load a SAP ALV export into a DataFrame.
+
+    SAP GUI's Export-as-Spreadsheet advertises .xlsx but the on-disk
+    format depends on the GUI version and the site's Office integration
+    setting: it may be a real ZIP-based xlsx (openpyxl), an MHTML file
+    wrapping an HTML <table> (read_html), or a legacy OLE .xls (xlrd).
+    Sniff the magic bytes and dispatch.
+    """
+    with open(path, "rb") as f:
+        head = f.read(2048)
+    if head[:4] == b"PK\x03\x04":
+        return pd.read_excel(path, engine="openpyxl")
+    if head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return pd.read_excel(path, engine="xlrd")
+    lowered = head.lower()
+    if b"mime-version:" in lowered or b"content-location:" in lowered:
+        with open(path, "rb") as f:
+            raw = f.read()
+        i = raw.lower().find(b"<html")
+        if i < 0:
+            raise RuntimeError(
+                f"SAP export {path} looks like MHTML but no <html> body was "
+                f"found.")
+        tables = pd.read_html(raw[i:])
+    elif b"<html" in lowered or b"<table" in lowered:
+        tables = pd.read_html(path)
+    else:
+        raise RuntimeError(
+            f"SAP export {path}: unrecognized file format "
+            f"(head={head[:16]!r}). Open the file manually to see what SAP "
+            f"actually wrote.")
+    if not tables:
+        raise RuntimeError(
+            f"SAP export {path}: no <table> found in the HTML body.")
+    return tables[0]
+
 def _col_letter(idx: int) -> str:
     """1-based column index -> Excel letter (only up to ZZ, plenty here)."""
     result = ""
@@ -695,7 +732,7 @@ def _fetch_step(
         _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
                         f"({size_kb:.0f} KB)")
 
-        df_chunk = pd.read_excel(export_path, engine="openpyxl")
+        df_chunk = _read_sap_export(export_path)
         # Item 2: verify the file matches what the grid showed. Fewer rows
         # than the grid = truncated export = silent data loss downstream.
         if len(df_chunk) < grid_rows:
