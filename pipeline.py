@@ -11,6 +11,7 @@ render them from its main thread.
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import sys
@@ -359,43 +360,6 @@ def _progress(on_event: EventFn, frac: float) -> None:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def _read_sap_export(path: str) -> pd.DataFrame:
-    """Load a SAP ALV export into a DataFrame.
-
-    SAP GUI's Export-as-Spreadsheet advertises .xlsx but the on-disk
-    format depends on the GUI version and the site's Office integration
-    setting: it may be a real ZIP-based xlsx (openpyxl), an MHTML file
-    wrapping an HTML <table> (read_html), or a legacy OLE .xls (xlrd).
-    Sniff the magic bytes and dispatch.
-    """
-    with open(path, "rb") as f:
-        head = f.read(2048)
-    if head[:4] == b"PK\x03\x04":
-        return pd.read_excel(path, engine="openpyxl")
-    if head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        return pd.read_excel(path, engine="xlrd")
-    lowered = head.lower()
-    if b"mime-version:" in lowered or b"content-location:" in lowered:
-        with open(path, "rb") as f:
-            raw = f.read()
-        i = raw.lower().find(b"<html")
-        if i < 0:
-            raise RuntimeError(
-                f"SAP export {path} looks like MHTML but no <html> body was "
-                f"found.")
-        tables = pd.read_html(raw[i:])
-    elif b"<html" in lowered or b"<table" in lowered:
-        tables = pd.read_html(path)
-    else:
-        raise RuntimeError(
-            f"SAP export {path}: unrecognized file format "
-            f"(head={head[:16]!r}). Open the file manually to see what SAP "
-            f"actually wrote.")
-    if not tables:
-        raise RuntimeError(
-            f"SAP export {path}: no <table> found in the HTML body.")
-    return tables[0]
-
 def _col_letter(idx: int) -> str:
     """1-based column index -> Excel letter (only up to ZZ, plenty here)."""
     result = ""
@@ -438,6 +402,156 @@ def _resolve_column(df: pd.DataFrame, canonical: str) -> str | None:
         if name in df.columns:
             return name
     return None
+
+
+# ---------------------------------------------------------------------------
+# Reading whatever SAP actually exported
+# ---------------------------------------------------------------------------
+
+# SAP names every ALV export ".xlsx", but only the `&XXL` path really writes
+# one. When `&XXL` is unavailable (older SAP GUI build, or no Excel/XXL
+# frontend integration -- it fails with "The control could not be found"),
+# `sap_ops.export_alv_to_file` falls back to `&PC` "Save as Local File",
+# which writes a DELIMITED TEXT file under that same .xlsx name. Feeding
+# that to pd.read_excel dies with "Excel file format cannot be determined,
+# you must specify an engine manually".
+#
+# Independently, on sites whose Office integration is enabled, the `&XXL`
+# path itself can write an MHTML-wrapped <table> under the .xlsx name --
+# openpyxl rejects that one with "not a zip file".
+#
+# So the extension tells us nothing: sniff the real format from the leading
+# bytes and dispatch on that.
+
+_ZIP_MAGIC = b"PK\x03\x04"          # .xlsx / OOXML (a zip container)
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0"   # legacy .xls (BIFF8 inside OLE2)
+
+
+def _decode_sap_text(raw: bytes) -> str:
+    """Decode an SAP text export: honour the BOM SAP writes on Unicode
+    systems, else fall back to the Windows frontend codepage.
+    """
+    for bom, enc in ((b"\xff\xfe\x00\x00", "utf-32"),
+                     (b"\x00\x00\xfe\xff", "utf-32"),
+                     (b"\xff\xfe", "utf-16"),
+                     (b"\xfe\xff", "utf-16"),
+                     (b"\xef\xbb\xbf", "utf-8-sig")):
+        if raw.startswith(bom):
+            return raw.decode(enc)
+    for enc in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", "replace")
+
+
+def _sap_text_to_frame(text: str) -> pd.DataFrame:
+    """Parse an SAP `&PC` export -- either the tab-delimited "Spreadsheet"
+    format or the pipe-ruled "unconverted" list format -- into a DataFrame.
+
+    Every cell stays a string. SAP already formatted the values the way the
+    ALV displayed them, and keeping them verbatim preserves leading zeros on
+    material / TO numbers that pandas' numeric inference would eat.
+    `normalize_key` canonicalizes both sides of the join anyway, so string
+    cells match exactly the rows numeric cells would.
+    """
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        # skip blanks and ALV list rulers: "--------" / "|----+----|"
+        if not s or set(s) <= set("-+| "):
+            continue
+        lines.append(ln)
+    if not lines:
+        return pd.DataFrame()
+
+    if sum(ln.count("|") for ln in lines) > sum(ln.count("\t") for ln in lines):
+        rows = [[c.strip() for c in ln.strip().strip("|").split("|")]
+                for ln in lines]
+    else:
+        rows = [[c.strip() for c in ln.split("\t")] for ln in lines]
+
+    # SAP prefixes some list exports with report title / run-date lines that
+    # carry fewer fields than the table. The real header row is the first one
+    # with the table's own field count (the most common width).
+    widths = [len(r) for r in rows]
+    modal = max(set(widths), key=widths.count)
+    first = widths.index(modal)
+    # Rows of a different width are footers ("3 record(s) selected") or wrapped
+    # lines; dropping them can only UNDER-count, which the caller's
+    # grid_rows comparison turns into a loud error rather than silent loss.
+    rows = [r for r in rows[first:] if len(r) == modal]
+
+    header = [h or f"Unnamed: {i}" for i, h in enumerate(rows[0])]
+    return pd.DataFrame(rows[1:], columns=header)
+
+
+def _read_sap_export(path: str, log=None) -> pd.DataFrame:
+    """Read the file `sap_ops.export_alv_to_file` produced, whatever format
+    SAP actually chose for it.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    head = raw[:2048]
+
+    if head.startswith(_ZIP_MAGIC):
+        return pd.read_excel(path, engine="openpyxl")
+
+    if head.startswith(_OLE2_MAGIC):
+        try:
+            return pd.read_excel(path, engine="xlrd")
+        except ImportError as e:
+            raise RuntimeError(
+                f"SAP exported a legacy .xls workbook ({path}); reading it "
+                f"needs the 'xlrd' package -- run: pip install xlrd"
+            ) from e
+
+    # MHTML / HTML: some sites' Office integration makes "Export as
+    # Spreadsheet" write an MHTML-wrapped <table> under the .xlsx name.
+    # The MIME preamble has to be sliced off before read_html sees it.
+    lowered = head.lower()
+    payload = None
+    if b"mime-version:" in lowered or b"content-location:" in lowered:
+        i = raw.lower().find(b"<html")
+        if i < 0:
+            raise RuntimeError(
+                f"SAP export {path} looks like MHTML but no <html> body was "
+                f"found.")
+        payload = raw[i:]
+    elif b"<html" in lowered or b"<table" in lowered:
+        payload = raw
+
+    if payload is not None:
+        # Must be a file-like object: pandas >=3 treats a bytes/str argument
+        # as a PATH, so passing the markup itself raises FileNotFoundError.
+        try:
+            tables = pd.read_html(io.BytesIO(payload))
+        except ImportError as e:
+            raise RuntimeError(
+                f"SAP exported an HTML/MHTML table ({path}); reading it needs "
+                f"the 'lxml' package -- run: pip install lxml"
+            ) from e
+        if not tables:
+            raise RuntimeError(
+                f"SAP export {path}: no <table> found in the HTML body.")
+        return tables[0]
+
+    text = _decode_sap_text(raw)
+    if log:
+        log("SAP: export is a delimited text file (&PC fallback), not xlsx -- "
+            "parsing as text")
+    df = _sap_text_to_frame(text)
+    # We only get here for a grid that reported rows (the caller skips empty
+    # grids), so a frame with no data rows means the file is not a delimited
+    # export at all -- say so instead of failing later on missing columns.
+    if df.empty:
+        raise RuntimeError(
+            f"Could not parse the SAP export at {path}: it is neither an "
+            f"xlsx/xls workbook nor a recognizable delimited text export. "
+            f"Open it manually to see what ZTBV actually wrote."
+        )
+    return df
 
 
 def _build_lookup(
@@ -732,7 +846,9 @@ def _fetch_step(
         _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
                         f"({size_kb:.0f} KB)")
 
-        df_chunk = _read_sap_export(export_path)
+        df_chunk = _read_sap_export(
+            export_path, log=lambda m: _log(on_event, m)
+        )
         # Item 2: verify the file matches what the grid showed. Fewer rows
         # than the grid = truncated export = silent data loss downstream.
         if len(df_chunk) < grid_rows:
