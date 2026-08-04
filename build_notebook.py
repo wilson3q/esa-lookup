@@ -125,6 +125,7 @@ IMPORTS = """\
 from __future__ import annotations
 
 import contextlib
+import difflib
 import io
 import os
 import re

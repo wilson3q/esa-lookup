@@ -11,6 +11,7 @@ render them from its main thread.
 """
 from __future__ import annotations
 
+import difflib
 import io
 import os
 import re
@@ -380,8 +381,10 @@ def _range(col_start: int, col_end: int, row_start: int, row_end: int) -> str:
 # short description rather than the technical field name. Try the technical
 # name first, then any known aliases. Extend per-site if needed.
 SAP_COLUMN_ALIASES: dict[str, list[str]] = {
-    "TANUM":       ["TANUM", "TO Number", "Transfer Order", "TrfOrd", "TrfOrdNo"],
-    "ABLAD":       ["ABLAD", "Unloading Point", "UnloadPt"],
+    "TANUM":       ["TANUM", "TO Number", "TO No.", "Transfer Order", "TrfOrd", "TrfOrdNo"],
+    # "Unl. Point" is what the ESA ZTBV layout actually prints for ABLAD --
+    # the ALV shows English short labels, not technical names.
+    "ABLAD":       ["ABLAD", "Unl. Point", "Unloading Point", "UnloadPt"],
     "QMNUM":       ["QMNUM", "Notification", "Notification No", "Notification Number"],
     "RSNUM":       ["RSNUM", "Reservation", "Reservation No", "Reservation Number", "Res.Number"],
     "RSPOS":       ["RSPOS", "Item", "Item No", "Item Number", "Res.Item"],
@@ -396,11 +399,32 @@ SAP_COLUMN_ALIASES: dict[str, list[str]] = {
 }
 
 
+def _norm_col(name) -> str:
+    """Fold an ALV column title for tolerant comparison: case, spaces, and
+    the punctuation SAP sprinkles through its abbreviations all ignored, so
+    "Unl. Point" / "Unl.Point" / "UNL POINT" are one name.
+    """
+    return re.sub(r"[\s._\-/]+", "", str(name)).lower()
+
+
 def _resolve_column(df: pd.DataFrame, canonical: str) -> str | None:
-    """Return whichever of `canonical`'s alias names is present in df, or None."""
-    for name in SAP_COLUMN_ALIASES.get(canonical, [canonical]):
+    """Return whichever of `canonical`'s alias names is present in df, or None.
+
+    Exact match first, then the folded comparison -- an ALV variant that
+    prints "Unl.Point" should still resolve an alias spelled "Unl. Point"
+    without needing a separate entry for every punctuation variant.
+    """
+    aliases = SAP_COLUMN_ALIASES.get(canonical, [canonical])
+    for name in aliases:
         if name in df.columns:
             return name
+    folded: dict[str, list[str]] = {}
+    for actual in df.columns:
+        folded.setdefault(_norm_col(actual), []).append(actual)
+    for name in aliases:
+        hits = folded.get(_norm_col(name))
+        if hits:
+            return hits[0]
     return None
 
 
@@ -582,14 +606,47 @@ def _build_lookup(
         else:
             resolved[c] = r
     if missing:
+        # Name the closest present titles: the ALV prints English short
+        # labels ("Unl. Point" for ABLAD), so the field is usually right
+        # there under a name no alias lists yet. Guessing it here saves a
+        # round trip to whoever is standing at the customer's machine.
+        hints = []
+        for c in missing:
+            near = difflib.get_close_matches(
+                c, [str(x) for x in df.columns], n=3, cutoff=0.4)
+            for alias in SAP_COLUMN_ALIASES.get(c, []):
+                near += difflib.get_close_matches(
+                    alias, [str(x) for x in df.columns], n=3, cutoff=0.6)
+            near = list(dict.fromkeys(near))[:3]
+            if near:
+                hints.append(f"  {c}: closest titles present are {near}")
         raise RuntimeError(
             "SAP export is missing these expected columns: "
             f"{missing}\n"
             f"Columns present in the export: {list(df.columns)}\n"
-            "Fix: edit the ALV layout in ZTBV so each missing field is shown "
+            + ("Did you mean:\n" + "\n".join(hints) + "\n" if hints else "")
+            + "Fix: edit the ALV layout in ZTBV so each missing field is shown "
             "(prefer 'Technical Name' as the column title) and re-save the "
             "default variant, OR add another alias to SAP_COLUMN_ALIASES in "
             "pipeline.py."
+        )
+
+    # A title repeated in the layout makes df[title] a DataFrame slice, so
+    # row[title] is a Series -- normalize_key would stringify the whole
+    # Series and pd.isna would raise "truth value is ambiguous". The ESA
+    # LTAP layout repeats 'Item', 'Typ', 'Sec' and 'B.pos' several times,
+    # so fail loudly here rather than write nonsense into the workbook.
+    titles = [str(x) for x in df.columns]
+    ambiguous = {c: r for c, r in resolved.items() if titles.count(str(r)) > 1}
+    if ambiguous:
+        raise RuntimeError(
+            "These SAP fields resolved to a column title that appears more "
+            "than once in the export, so the right one cannot be told apart:\n"
+            + "\n".join(f"  {c} -> {r!r} (appears {titles.count(str(r))} times)"
+                        for c, r in ambiguous.items())
+            + "\nFix: edit the ALV layout in ZTBV to show 'Technical Name' as "
+            "the column title (which is unique per field), or remove the "
+            "duplicate columns from the layout and re-save the variant."
         )
     out: dict[str, dict] = {}
     dup_count = 0
