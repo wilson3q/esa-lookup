@@ -6,6 +6,7 @@ logged in before the app is launched.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -90,6 +91,98 @@ def open_ztbv_table(s: SapSession, table: str, log=None) -> None:
     s.find("wnd[0]/usr/ctxtD_TAB").caretPosition = len(table)
     s.find("wnd[0]/tbar[1]/btn[8]").press()  # F8 -> selection screen
     time.sleep(0.3)
+
+
+def describe_selection_screen(s, log=None) -> list[dict]:
+    """List every multi-value ('=>' arrow) filter on the current ZTBV
+    selection screen, with the on-screen label next to each one.
+
+    ZTBV names its select-options generically -- S3, S15, S29 -- so which
+    slot is which field cannot be inferred from the id alone, and guessing
+    would paste values into the wrong filter and return confidently wrong
+    data. Run this once against a table to read the mapping off the screen
+    instead of recording it by hand:
+
+        import sap_ops
+        for f in sap_ops.describe_selection_screen(sap_ops.attach()):
+            print(f["param"], f["label"], f["push_id"], sep=" | ")
+
+    Call it AFTER open_ztbv_table(), while the selection screen is up.
+    Returns [{param, label, push_id, low_field}], one per filter.
+    """
+    try:
+        usr = s.find("wnd[0]/usr")
+    except Exception as e:
+        raise SapError(f"No selection screen on wnd[0]/usr: {e}") from e
+
+    # Collect every control on the screen, then pair the multi-value push
+    # buttons with the label sitting on the same screen row.
+    controls = []
+    def walk(node, depth=0):
+        if depth > 4:
+            return
+        try:
+            children = node.Children
+        except Exception:
+            return
+        for i in range(children.Count):
+            try:
+                c = children(i)
+                controls.append(c)
+                walk(c, depth + 1)
+            except Exception:
+                continue
+    walk(usr)
+
+    def attr(c, name, default=""):
+        try:
+            v = getattr(c, name)
+            return "" if v is None else str(v)
+        except Exception:
+            return default
+
+    labels_by_top: dict[int, str] = {}
+    for c in controls:
+        if attr(c, "Type") in ("GuiLabel", "GuiTextField") and attr(c, "Text").strip():
+            try:
+                top = int(c.Top)
+            except Exception:
+                continue
+            txt = attr(c, "Text").strip()
+            # keep the leftmost label on that row -- that is the field name
+            if top not in labels_by_top or len(txt) > len(labels_by_top[top]):
+                labels_by_top[top] = txt
+
+    out: list[dict] = []
+    for c in controls:
+        cid = attr(c, "Id")
+        if "VALU_PUSH" not in cid:
+            continue
+        m = re.search(r"btn%_(.+?)_%_APP_%-VALU_PUSH", cid)
+        param = m.group(1) if m else "?"
+        try:
+            top = int(c.Top)
+        except Exception:
+            top = -1
+        label = labels_by_top.get(top, "")
+        if not label:
+            # fall back to the nearest label above this row
+            near = [t for t in labels_by_top if 0 <= top - t <= 2]
+            label = labels_by_top[max(near)] if near else "(no label found)"
+        entry = {
+            "param": param,
+            "label": label,
+            "push_id": cid[cid.find("wnd[0]"):] if "wnd[0]" in cid else cid,
+            "low_field": f"wnd[0]/usr/ctxt{param}-LOW",
+        }
+        out.append(entry)
+        if log:
+            log(f"SAP: filter {param:<6} label={label!r}")
+    if not out:
+        raise SapError(
+            "No multi-value filter buttons found. Is the ZTBV selection "
+            "screen actually displayed (call open_ztbv_table first)?")
+    return out
 
 
 def paste_multi_value_filter(
