@@ -897,6 +897,17 @@ def _fetch_step(
     push_id = sap_ops.PUSH_BUTTONS[(step.sap_table, step.push_button_field)]
     frames: list[pd.DataFrame] = []
     ts = int(time.time())
+    # Every SAP field this step needs, by technical name -- what the grid
+    # reader asks for, and exactly what the original notebook read.
+    wanted_cols = list(dict.fromkeys(
+        step.sap_key_columns
+        + step.sap_output_columns
+        + [e.sap_col for e in step.extras if e.sap_col]
+    ))
+    # One export fallback decision per step, not per chunk: if the grid read
+    # is unavailable here it will be unavailable for every other chunk too,
+    # and flip-flopping between paths mid-step would mix column namings.
+    use_grid = True
     for ci, chunk in enumerate(chunks):
         if stop.is_set():
             raise Cancelled()
@@ -935,6 +946,40 @@ def _fetch_step(
             _log(on_event, f"SAP returned 0 rows{tag}; nothing to export", "warn")
             sub_progress(2 + 4 * (ci + 1) / len(chunks))
             continue
+
+        # --- Primary read: the grid itself, by technical field name ------
+        # Ported from the original notebook. It sidesteps the export file
+        # format entirely and, because technical names are unique per field,
+        # every alias / duplicate-title / short-label problem with it.
+        if use_grid:
+            try:
+                _status(on_event,
+                        f"[{step_index + 1}/{total_steps}] SAP: reading ALV grid "
+                        f"({grid_rows} rows){tag}")
+                read_start = time.time()
+                records = sap_ops.read_alv_grid(
+                    sap, wanted_cols, log=lambda m: _log(on_event, m), stop=stop)
+                if stop.is_set():
+                    raise Cancelled()
+                df_chunk = pd.DataFrame(records, columns=wanted_cols)
+                _log(on_event,
+                     f"grid read finished in {time.time() - read_start:.1f}s "
+                     f"({len(df_chunk)} rows)")
+                if len(df_chunk) < grid_rows:
+                    raise RuntimeError(
+                        f"Grid read row-count mismatch{tag}: the status bar "
+                        f"reports {grid_rows} row(s) but only "
+                        f"{len(df_chunk)} were read.")
+                frames.append(df_chunk)
+                sub_progress(2 + 4 * (ci + 1) / len(chunks))
+                continue
+            except sap_ops.SapError as e:
+                # A missing technical name is the expected reason to land
+                # here; fall back to the export for the rest of the step.
+                _log(on_event,
+                     f"grid read unavailable ({e}); falling back to the file "
+                     f"export for this step", "warn")
+                use_grid = False
 
         _status(on_event,
                 f"[{step_index + 1}/{total_steps}] SAP: exporting ALV grid "

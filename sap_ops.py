@@ -331,6 +331,101 @@ def export_alv_to_file(
     ) from last_err
 
 
+def _visible_row_count(grid) -> int:
+    """Rows the ALV control currently holds in the frontend buffer."""
+    try:
+        n = int(grid.VisibleRowCount)
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return 20
+
+
+def _scroll_grid(grid, row_number: int) -> bool:
+    try:
+        grid.firstVisibleRow = row_number
+        return True
+    except Exception:
+        pass
+    try:
+        grid.VerticalScrollbar.Position = row_number
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def _safe_cell(grid, row: int, column: str) -> str:
+    """GetCellValue with the original's scroll-and-retry: a row can fall out
+    of the frontend buffer between the scroll and the read.
+    """
+    for _ in range(3):
+        try:
+            return grid.GetCellValue(row, column)
+        except Exception:
+            _scroll_grid(grid, row)
+            time.sleep(0.2)
+    return ""
+
+
+def read_alv_grid(
+    s: SapSession,
+    columns: list[str],
+    log=None,
+    stop=None,
+) -> list[dict]:
+    """Read `columns` straight off the ALV grid, by TECHNICAL field name.
+
+    This is the original notebook's read path (GetCellValue + scroll), and
+    it is why that version never had to care what the layout titles its
+    columns: 'TANUM' is 'TANUM' whether the ALV displays it as 'TO Number'
+    or 'Transfer Order'. No alias table, no ambiguity when a layout repeats
+    a title, no dependence on the export file format.
+
+    Only the requested columns are fetched, so the cost is
+    rows x len(columns) -- not rows x every field in the layout.
+
+    Raises SapError if a name is not in the grid (wrong technical name, or
+    the field is absent from the displayed variant) so the caller can fall
+    back to the file export.
+    """
+    grid = s.find("wnd[0]/shellcont/shell")
+    try:
+        row_count = int(grid.RowCount)
+    except Exception as e:
+        raise SapError(f"ALV grid exposes no RowCount: {e}") from e
+    if row_count == 0:
+        return []
+
+    # Fail fast on a bad column name: probe row 0 once per column before
+    # committing to a full scroll-and-read pass.
+    for c in columns:
+        try:
+            grid.GetCellValue(0, c)
+        except Exception as e:
+            raise SapError(
+                f"ALV grid has no column {c!r} (technical name). Either the "
+                f"field is missing from the displayed layout variant, or the "
+                f"name differs on this system. Original error: {e}"
+            ) from e
+
+    visible = _visible_row_count(grid)
+    if log:
+        log(f"SAP: reading {row_count} row(s) x {len(columns)} column(s) "
+            f"from the ALV grid by technical name")
+
+    out: list[dict] = []
+    for start in range(0, row_count, visible):
+        if stop is not None and stop.is_set():
+            break
+        _scroll_grid(grid, start)
+        time.sleep(0.05)
+        for r in range(start, min(start + visible, row_count)):
+            out.append({c: _safe_cell(grid, r, c) for c in columns})
+    return out
+
+
 # Multi-value push button IDs on the ZTBV selection screen per (table, field).
 # These match the notebook. If a site uses a customized ZTBV layout the S<n>
 # indices may shift -- record once with the Script Recorder and update here.

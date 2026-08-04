@@ -171,6 +171,7 @@ class FakeEnv:
         self.fail_table: str | None = None       # query_result_check raises
         self.zero_tables: set = set()            # query returns 0 rows
         self.truncate_tables: set = set()        # grid claims more than export
+        self.no_grid_tables: set = set()         # force the export fallback
         self.file_import_fails = False           # simulate unscriptable dialog
         self.clipboard_stages = 0
         self.sheet = FakeSheet(self)
@@ -228,8 +229,23 @@ class FakeEnv:
             n = len(env.sap_tables[t])
             return n + 5 if t in env.truncate_tables else n
 
+        def read_grid(sap, columns, log=None, stop=None):
+            """Primary path: the ALV grid, addressed by technical name."""
+            table = env.current_table
+            if table in env.no_grid_tables:
+                raise sap_ops.SapError("simulated: grid read unavailable")
+            df = env.sap_tables[table]
+            missing = [c for c in columns if c not in df.columns]
+            if missing:
+                raise sap_ops.SapError(
+                    f"ALV grid has no column {missing[0]!r} (technical name)")
+            env.events.append(("fetch", table))
+            env.events.append(("gridread", table))
+            return df[list(columns)].to_dict("records")
+
         def export(sap, target_dir, filename, log=None, timeout_s=30):
             table = env.current_table
+            env.events.append(("fetch", table))
             env.events.append(("export", table))
             os.makedirs(target_dir, exist_ok=True)
             path = os.path.join(target_dir, filename)
@@ -254,6 +270,7 @@ class FakeEnv:
         mp.setattr(sap_ops, "paste_multi_value_filter", paste_clipboard)
         mp.setattr(sap_ops, "execute_query", lambda s, log=None: None)
         mp.setattr(sap_ops, "query_result_check", check)
+        mp.setattr(sap_ops, "read_alv_grid", read_grid)
         mp.setattr(sap_ops, "export_alv_to_file", export)
 
     # -- helpers -----------------------------------------------------------

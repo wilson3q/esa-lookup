@@ -34,7 +34,7 @@ class TestToWorkflow:
         ok, _ = env.run("TO")
         assert ok
         kinds = [k for k, _ in env.events]
-        last_export = max(i for i, k in enumerate(kinds) if k == "export")
+        last_export = max(i for i, k in enumerate(kinds) if k == "fetch")
         first_mutation = min(
             i for i, k in enumerate(kinds) if k in ("clear", "write"))
         assert first_mutation > last_export
@@ -129,7 +129,7 @@ class TestDryRun:
         assert ok, logs
         assert env.grid == make_to_grid()       # byte-identical
         # SAP side ran fully (all three exports)
-        assert [k for k, _ in env.events].count("export") == 3
+        assert [k for k, _ in env.events].count("fetch") == 3
         assert "DRY RUN" in logs
         assert "2 matched / 0 unmatched" in logs
         assert "was not modified" in logs
