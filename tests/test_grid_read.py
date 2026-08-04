@@ -46,8 +46,9 @@ class TestGridIsPrimary:
         assert ok
         # Step 1 needs exactly TANUM (key) + ABLAD (output).
         assert asked[0] == ["TANUM", "ABLAD"]
-        # Nothing asks for the whole table.
-        assert all(len(cols) <= 6 for cols in asked), asked
+        # Nothing asks for the whole table (step 2 is the widest: TANUM key
+        # + 3 outputs + QMNUM/RSNUM/RSPOS extras = 7 of ~100 layout fields).
+        assert all(len(cols) <= 7 for cols in asked), asked
 
 
 class TestExportFallback:

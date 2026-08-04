@@ -25,7 +25,9 @@ class TestToWorkflow:
         ok, _ = env.run("TO")
         assert ok
         pastes = env.pastes()
-        assert pastes == [["T001", "T002"], ["100", "200"], ["OBJ1", "OBJ2"]]
+        # steps 1 and 2 both key on K (TO numbers); step 3 keys on the OBJNR
+        # values step 2 published in memory
+        assert pastes == [["T001", "T002"], ["T001", "T002"], ["OBJ1", "OBJ2"]]
         # the sentinel garbage in column C must never reach SAP
         assert not any("STALE" in v for p in pastes for v in p)
 
@@ -96,7 +98,7 @@ class TestSapSelfChecks:
         ok, logs = env.run("TO")
         assert ok, logs
         env.assert_cells(EXPECTED_TO)
-        assert env.pastes() == [["T001"], ["T002"], ["100"], ["200"],
+        assert env.pastes() == [["T001"], ["T002"], ["T001"], ["T002"],
                                 ["OBJ1"], ["OBJ2"]]
         assert "2 chunk(s) of <= 1" in logs
 

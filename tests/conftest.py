@@ -102,6 +102,7 @@ def default_sap_tables() -> dict[str, pd.DataFrame]:
         "LTAP": pd.DataFrame({
             "TANUM": ["T001", "T002"], "ABLAD": ["DockA", "DockB"]}),
         "Z50CFG_ENG_CRNT": pd.DataFrame({
+            "TANUM": ["T001", "T002"],
             "QMNUM": ["QN1", "QN2"], "RSNUM": [100, 200], "RSPOS": [1, 2],
             "OBJNR": ["OBJ1", "OBJ2"], "DISP_MATNR": ["MAT1", "MAT2"],
             "DISP_QTY": [5, 7]}),
@@ -139,12 +140,14 @@ def make_notif_grid() -> dict:
 
 EXPECTED_TO = {
     (2, 13): "DockA", (3, 13): "DockB",            # M
-    (2, 1): "QN1", (3, 1): "QN2",                  # A overwritten on match
+    (2, 1): "QN1", (3, 1): "QN2",                  # A: QMNUM derived on match
+    (2, 14): 100, (3, 14): 200,                    # N: RSNUM derived on match
+    (2, 15): 1, (3, 15): 2,                        # O: RSPOS derived on match
     (2, 3): "OBJ1", (3, 3): "OBJ2",                # C from step 2
     (2, 4): "MAT1", (2, 5): 5,                     # D, E
     (2, 6): "S1", (2, 7): "M1", (2, 8): "D1", (2, 9): "SO1",  # F..I
     (2, 10): "keepJ2", (3, 10): "keepJ3",          # J preserved on match
-    (2, 16): "100|1", (3, 16): "200|2",            # P audit key
+    (2, 16): "T001", (3, 16): "T002",              # P audit key (TO-keyed)
     (1, 16): "Excel Match Key Used",
 }
 
@@ -271,6 +274,8 @@ class FakeEnv:
         mp.setattr(sap_ops, "execute_query", lambda s, log=None: None)
         mp.setattr(sap_ops, "query_result_check", check)
         mp.setattr(sap_ops, "read_alv_grid", read_grid)
+        mp.setattr(sap_ops, "resolve_push_button",
+                   lambda s, table, field, log=None: f"btn_{table}_{field}")
         mp.setattr(sap_ops, "export_alv_to_file", export)
 
     # -- helpers -----------------------------------------------------------

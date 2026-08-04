@@ -193,19 +193,33 @@ WORKFLOWS = {
             excel_output_columns=[13],            # M
         ),
         LookupStep(
-            name="Z50CFG_ENG_CRNT (Reservation) -> QMNUM/OBJNR/DISP",
+            # ESA rework (2026-08): the original keyed this step on N|O
+            # (reservation number + item), which the operator had to fill by
+            # hand between steps. Per the ESA developers' demo, the same
+            # table answers a TO-number query directly -- Z50CFG_ENG_CRNT
+            # carries the TO pair and the reservation pair on one row -- so
+            # the step now keys on column K (already filled for step 1) and
+            # DERIVES the rest: QMNUM -> A, RSNUM -> N, RSPOS -> O. Rows
+            # whose TO number found no CRNT row are simply unmatched, same
+            # as the demo's pasted blanks being ignored by SAP.
+            name="Z50CFG_ENG_CRNT (TO Number) -> QMNUM/OBJNR/DISP",
             sap_table="Z50CFG_ENG_CRNT",
-            push_button_field="RSNUM",
-            key_columns=[14, 15],                 # N | O
-            sap_key_columns=["RSNUM", "RSPOS"],
+            push_button_field="TO_NUMBER",
+            key_columns=[11],                     # K (same input as step 1)
+            sap_key_columns=["TANUM"],
             sap_output_columns=["OBJNR", "DISP_MATNR", "DISP_QTY"],
             excel_output_columns=[3, 4, 5],       # C, D, E
-            # Notebook: A gets written on match with QMNUM but MUST NOT be
-            # touched on non-match ("Do not touch Column A if there is no
-            # match" -- line 874 in the original notebook). ClearContents
-            # covers C..E only, so A is preserved on skip as well.
-            extras=[ExtraOutput(excel_col=1, sap_col="QMNUM", preserve_on_nonmatch=True)],
-            match_key_column=16,                  # P: audit-trail composite key (notebook line 851, 863)
+            extras=[
+                # Notebook rule kept: A gets QMNUM on match but MUST NOT be
+                # touched on non-match ("Do not touch Column A if there is
+                # no match"). N/O are now outputs (the derived reservation
+                # pair) -- also preserved on non-match so a hand-entered
+                # value is never clobbered by a miss.
+                ExtraOutput(excel_col=1, sap_col="QMNUM", preserve_on_nonmatch=True),
+                ExtraOutput(excel_col=14, sap_col="RSNUM", preserve_on_nonmatch=True),
+                ExtraOutput(excel_col=15, sap_col="RSPOS", preserve_on_nonmatch=True),
+            ],
+            match_key_column=16,                  # P: audit-trail composite key
         ),
         LookupStep(
             name="Z50CFG_ENG_VALD -> Section/Module/Description/SalesDoc",
@@ -899,7 +913,10 @@ def _fetch_step(
              f"splitting {len(unique_paste_values)} key(s) into {len(chunks)} "
              f"chunk(s) of <= {SAP_FILTER_CHUNK_SIZE}")
 
-    push_id = sap_ops.PUSH_BUTTONS[(step.sap_table, step.push_button_field)]
+    # Resolved on the first chunk, after open_ztbv_table has the selection
+    # screen up -- a (table, field) pair missing from PUSH_BUTTONS is then
+    # found by its on-screen label instead of failing.
+    push_id: str | None = None
     frames: list[pd.DataFrame] = []
     ts = int(time.time())
     # Every SAP field this step needs, by technical name -- what the grid
@@ -920,6 +937,10 @@ def _fetch_step(
 
         _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}{tag}")
         sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
+        if push_id is None:
+            push_id = sap_ops.resolve_push_button(
+                sap, step.sap_table, step.push_button_field,
+                log=lambda m: _log(on_event, m))
         _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: sending {len(chunk)} filter values{tag}")
         try:
             # Item 3: primary transport is a temp text file ('Import from

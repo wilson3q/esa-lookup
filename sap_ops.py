@@ -528,3 +528,63 @@ PUSH_BUTTONS = {
     ("Z50CFG_ENG_CRNT", "QMNUM"): "wnd[0]/usr/btn%_S29_%_APP_%-VALU_PUSH",
     ("Z50CFG_ENG_VALD", "OBJNR"): "wnd[0]/usr/btn%_S2_%_APP_%-VALU_PUSH",
 }
+
+# On-screen label fragments per logical field, all lowercase. Used by
+# resolve_push_button to find a filter slot that PUSH_BUTTONS does not list
+# yet -- ZTBV's S<n> parameter names are generic, but the label printed next
+# to each filter names the field, so match on that.
+FIELD_LABEL_SYNONYMS = {
+    "TO_NUMBER": ["transfer order", "to number", "to no"],
+    "RSNUM": ["reservation"],
+    "QMNUM": ["notification", "notifctn"],
+    "OBJNR": ["object"],
+}
+
+
+def resolve_push_button(s, table: str, field: str, log=None) -> str:
+    """Return the multi-value push button id for (table, field).
+
+    Known combinations come straight from PUSH_BUTTONS. For a combination
+    not listed there, the CURRENTLY DISPLAYED selection screen is walked
+    (describe_selection_screen) and the filter whose on-screen label matches
+    the field's synonyms is chosen -- so a new table/field pairing costs a
+    label lookup at runtime instead of a Script Recorder session.
+
+    Exactly one label must match. Zero or several matches raise SapError
+    listing every filter on the screen, because pasting keys into the wrong
+    filter would return plausible-looking wrong data -- the one failure mode
+    worse than stopping.
+
+    A resolved id is cached into PUSH_BUTTONS for the rest of the process.
+    Must be called AFTER open_ztbv_table() so the screen is displayed.
+    """
+    key = (table, field)
+    if key in PUSH_BUTTONS:
+        return PUSH_BUTTONS[key]
+
+    synonyms = FIELD_LABEL_SYNONYMS.get(field)
+    if not synonyms:
+        raise SapError(
+            f"No push button known for {key} and no label synonyms defined "
+            f"for {field!r} -- add it to FIELD_LABEL_SYNONYMS or "
+            f"PUSH_BUTTONS in sap_ops.")
+
+    filters = describe_selection_screen(s, log=log)
+    hits = [f for f in filters
+            if any(syn in f["label"].lower() for syn in synonyms)]
+    listing = "\n".join(
+        f"  {f['param']:<6} {f['label']!r}" for f in filters)
+    if len(hits) != 1:
+        raise SapError(
+            f"Could not resolve the {field} filter on {table}: "
+            f"{len(hits)} label(s) matched {synonyms}. Filters on this "
+            f"screen:\n{listing}\n"
+            f"Fix: add the right id to PUSH_BUTTONS[({table!r}, {field!r})] "
+            f"in sap_ops (the push_id column above is already in the "
+            f"required format).")
+    resolved = hits[0]["push_id"]
+    PUSH_BUTTONS[key] = resolved
+    if log:
+        log(f"SAP: resolved {field} on {table} -> {hits[0]['param']} "
+            f"(label {hits[0]['label']!r}) by on-screen label")
+    return resolved
