@@ -403,6 +403,134 @@ def _resolve_column(df: pd.DataFrame, canonical: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Reading whatever SAP actually exported
+# ---------------------------------------------------------------------------
+
+# SAP names every ALV export ".xlsx", but only the `&XXL` path really writes
+# one. When `&XXL` is unavailable (older SAP GUI build, or no Excel/XXL
+# frontend integration -- it fails with "The control could not be found"),
+# `sap_ops.export_alv_to_file` falls back to `&PC` "Save as Local File",
+# which writes a DELIMITED TEXT file under that same .xlsx name. Feeding
+# that to pd.read_excel dies with "Excel file format cannot be determined,
+# you must specify an engine manually". So sniff the real format from the
+# leading bytes and dispatch on that -- never trust the extension.
+
+_ZIP_MAGIC = b"PK\x03\x04"          # .xlsx / OOXML (a zip container)
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0"   # legacy .xls (BIFF8 inside OLE2)
+
+
+def _decode_sap_text(raw: bytes) -> str:
+    """Decode an SAP text export: honour the BOM SAP writes on Unicode
+    systems, else fall back to the Windows frontend codepage.
+    """
+    for bom, enc in ((b"\xff\xfe\x00\x00", "utf-32"),
+                     (b"\x00\x00\xfe\xff", "utf-32"),
+                     (b"\xff\xfe", "utf-16"),
+                     (b"\xfe\xff", "utf-16"),
+                     (b"\xef\xbb\xbf", "utf-8-sig")):
+        if raw.startswith(bom):
+            return raw.decode(enc)
+    for enc in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", "replace")
+
+
+def _sap_text_to_frame(text: str) -> pd.DataFrame:
+    """Parse an SAP `&PC` export -- either the tab-delimited "Spreadsheet"
+    format or the pipe-ruled "unconverted" list format -- into a DataFrame.
+
+    Every cell stays a string. SAP already formatted the values the way the
+    ALV displayed them, and keeping them verbatim preserves leading zeros on
+    material / TO numbers that pandas' numeric inference would eat.
+    `normalize_key` canonicalizes both sides of the join anyway, so string
+    cells match exactly the rows numeric cells would.
+    """
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        # skip blanks and ALV list rulers: "--------" / "|----+----|"
+        if not s or set(s) <= set("-+| "):
+            continue
+        lines.append(ln)
+    if not lines:
+        return pd.DataFrame()
+
+    if sum(ln.count("|") for ln in lines) > sum(ln.count("\t") for ln in lines):
+        rows = [[c.strip() for c in ln.strip().strip("|").split("|")]
+                for ln in lines]
+    else:
+        rows = [[c.strip() for c in ln.split("\t")] for ln in lines]
+
+    # SAP prefixes some list exports with report title / run-date lines that
+    # carry fewer fields than the table. The real header row is the first one
+    # with the table's own field count (the most common width).
+    widths = [len(r) for r in rows]
+    modal = max(set(widths), key=widths.count)
+    first = widths.index(modal)
+    # Rows of a different width are footers ("3 record(s) selected") or wrapped
+    # lines; dropping them can only UNDER-count, which the caller's
+    # grid_rows comparison turns into a loud error rather than silent loss.
+    rows = [r for r in rows[first:] if len(r) == modal]
+
+    header = [h or f"Unnamed: {i}" for i, h in enumerate(rows[0])]
+    return pd.DataFrame(rows[1:], columns=header)
+
+
+def _read_sap_export(path: str, log=None) -> pd.DataFrame:
+    """Read the file `sap_ops.export_alv_to_file` produced, whatever format
+    SAP actually chose for it.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+
+    if head.startswith(_ZIP_MAGIC):
+        return pd.read_excel(path, engine="openpyxl")
+
+    if head.startswith(_OLE2_MAGIC):
+        try:
+            return pd.read_excel(path, engine="xlrd")
+        except ImportError as e:
+            raise RuntimeError(
+                f"SAP exported a legacy .xls workbook ({path}); reading it "
+                f"needs the 'xlrd' package -- run: pip install xlrd"
+            ) from e
+
+    with open(path, "rb") as fh:
+        text = _decode_sap_text(fh.read())
+
+    sniff = text.lstrip()[:200].lower()
+    if sniff.startswith(("<html", "<!doctype html", "<?xml", "mime-version")):
+        try:
+            tables = pd.read_html(path)
+        except ImportError as e:
+            raise RuntimeError(
+                f"SAP exported an HTML/MHTML table ({path}); reading it needs "
+                f"the 'lxml' package -- run: pip install lxml"
+            ) from e
+        if not tables:
+            raise RuntimeError(f"No table found in the HTML export {path}")
+        return tables[0]
+
+    if log:
+        log("SAP: export is a delimited text file (&PC fallback), not xlsx -- "
+            "parsing as text")
+    df = _sap_text_to_frame(text)
+    # We only get here for a grid that reported rows (the caller skips empty
+    # grids), so a frame with no data rows means the file is not a delimited
+    # export at all -- say so instead of failing later on missing columns.
+    if df.empty:
+        raise RuntimeError(
+            f"Could not parse the SAP export at {path}: it is neither an "
+            f"xlsx/xls workbook nor a recognizable delimited text export. "
+            f"Open it manually to see what ZTBV actually wrote."
+        )
+    return df
+
+
 def _build_lookup(
     df: pd.DataFrame,
     key_cols: list[str],
@@ -695,7 +823,9 @@ def _fetch_step(
         _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
                         f"({size_kb:.0f} KB)")
 
-        df_chunk = pd.read_excel(export_path)
+        df_chunk = _read_sap_export(
+            export_path, log=lambda m: _log(on_event, m)
+        )
         # Item 2: verify the file matches what the grid showed. Fewer rows
         # than the grid = truncated export = silent data loss downstream.
         if len(df_chunk) < grid_rows:
