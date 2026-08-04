@@ -65,6 +65,48 @@ class TestDecodeSapText:
         assert _decode_sap_text(b"A\xff\xfeB\x81") != ""
 
 
+_HTML_TABLE = (
+    "<html><body><table>"
+    "<tr><th>TANUM</th><th>ABLAD</th></tr>"
+    "<tr><td>0001785822</td><td>BAY-12</td></tr>"
+    "</table></body></html>"
+)
+
+# What SAP writes where the site's Office integration is on: the HTML table
+# wrapped in a MIME preamble, still named .xlsx.
+MHTML_EXPORT = (
+    "MIME-Version: 1.0\n"
+    "Content-Location: file:///C:/temp/export.mhtml\n"
+    'Content-Type: multipart/related; boundary="----=_NextPart_01"\n\n'
+    "------=_NextPart_01\n"
+    'Content-Type: text/html; charset="windows-1252"\n\n'
+    + _HTML_TABLE
+)
+
+
+class TestMhtmlAndHtml:
+    """The other `&XXL` failure mode: an MHTML-wrapped table named .xlsx."""
+
+    def test_mhtml_preamble_is_stripped(self, tmp_path):
+        p = tmp_path / "export.xlsx"
+        p.write_bytes(MHTML_EXPORT.encode("cp1252"))
+        df = _read_sap_export(str(p))
+        assert list(df.columns) == ["TANUM", "ABLAD"]
+        assert len(df) == 1
+
+    def test_bare_html_table(self, tmp_path):
+        p = tmp_path / "export.xlsx"
+        p.write_bytes(_HTML_TABLE.encode("utf-8"))
+        df = _read_sap_export(str(p))
+        assert list(df.columns) == ["TANUM", "ABLAD"]
+
+    def test_mhtml_without_html_body_raises(self, tmp_path):
+        p = tmp_path / "export.xlsx"
+        p.write_bytes(b"MIME-Version: 1.0\nContent-Location: f\n\nno body\n")
+        with pytest.raises(RuntimeError, match="no <html> body"):
+            _read_sap_export(str(p))
+
+
 class TestReadSapExport:
     def test_text_file_named_xlsx(self, tmp_path):
         """The exact failure the developer hit."""

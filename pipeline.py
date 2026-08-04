@@ -11,6 +11,7 @@ render them from its main thread.
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import sys
@@ -413,8 +414,14 @@ def _resolve_column(df: pd.DataFrame, canonical: str) -> str | None:
 # `sap_ops.export_alv_to_file` falls back to `&PC` "Save as Local File",
 # which writes a DELIMITED TEXT file under that same .xlsx name. Feeding
 # that to pd.read_excel dies with "Excel file format cannot be determined,
-# you must specify an engine manually". So sniff the real format from the
-# leading bytes and dispatch on that -- never trust the extension.
+# you must specify an engine manually".
+#
+# Independently, on sites whose Office integration is enabled, the `&XXL`
+# path itself can write an MHTML-wrapped <table> under the .xlsx name --
+# openpyxl rejects that one with "not a zip file".
+#
+# So the extension tells us nothing: sniff the real format from the leading
+# bytes and dispatch on that.
 
 _ZIP_MAGIC = b"PK\x03\x04"          # .xlsx / OOXML (a zip container)
 _OLE2_MAGIC = b"\xd0\xcf\x11\xe0"   # legacy .xls (BIFF8 inside OLE2)
@@ -485,7 +492,8 @@ def _read_sap_export(path: str, log=None) -> pd.DataFrame:
     SAP actually chose for it.
     """
     with open(path, "rb") as fh:
-        head = fh.read(8)
+        raw = fh.read()
+    head = raw[:2048]
 
     if head.startswith(_ZIP_MAGIC):
         return pd.read_excel(path, engine="openpyxl")
@@ -499,22 +507,37 @@ def _read_sap_export(path: str, log=None) -> pd.DataFrame:
                 f"needs the 'xlrd' package -- run: pip install xlrd"
             ) from e
 
-    with open(path, "rb") as fh:
-        text = _decode_sap_text(fh.read())
+    # MHTML / HTML: some sites' Office integration makes "Export as
+    # Spreadsheet" write an MHTML-wrapped <table> under the .xlsx name.
+    # The MIME preamble has to be sliced off before read_html sees it.
+    lowered = head.lower()
+    payload = None
+    if b"mime-version:" in lowered or b"content-location:" in lowered:
+        i = raw.lower().find(b"<html")
+        if i < 0:
+            raise RuntimeError(
+                f"SAP export {path} looks like MHTML but no <html> body was "
+                f"found.")
+        payload = raw[i:]
+    elif b"<html" in lowered or b"<table" in lowered:
+        payload = raw
 
-    sniff = text.lstrip()[:200].lower()
-    if sniff.startswith(("<html", "<!doctype html", "<?xml", "mime-version")):
+    if payload is not None:
+        # Must be a file-like object: pandas >=3 treats a bytes/str argument
+        # as a PATH, so passing the markup itself raises FileNotFoundError.
         try:
-            tables = pd.read_html(path)
+            tables = pd.read_html(io.BytesIO(payload))
         except ImportError as e:
             raise RuntimeError(
                 f"SAP exported an HTML/MHTML table ({path}); reading it needs "
                 f"the 'lxml' package -- run: pip install lxml"
             ) from e
         if not tables:
-            raise RuntimeError(f"No table found in the HTML export {path}")
+            raise RuntimeError(
+                f"SAP export {path}: no <table> found in the HTML body.")
         return tables[0]
 
+    text = _decode_sap_text(raw)
     if log:
         log("SAP: export is a delimited text file (&PC fallback), not xlsx -- "
             "parsing as text")
