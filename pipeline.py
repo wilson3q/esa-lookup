@@ -822,32 +822,37 @@ def _fetch_step(
     # log summary. The write-back treats skip rows as non-matches, which
     # is what the notebook does implicitly (its else branch fires for any
     # composite key that's not in the SAP result set, including "NOTFOUND|").
-    skip_flags = [_is_skip_key_cell(key_vals[primary_col][i]) for i in range(n_rows)]
+    # ESA rule: a row is processed only when EVERY part of its key has a
+    # value. A sheet legitimately mixes rows that carry a reservation with
+    # rows that do not -- the complete ones must still be processed, and the
+    # incomplete ones are skipped rather than failing anything. Previously
+    # only the PRIMARY cell was tested, so "N filled, O blank" was sent to
+    # SAP and then reported as unmatched.
+    skip_flags = [
+        any(_is_skip_key_cell(key_vals[c][i]) for c in ordered_cols)
+        for i in range(n_rows)
+    ]
 
-    # A row whose PRIMARY key cell is filled but whose other key parts are
-    # blank builds a composite like "514368344|" that cannot match anything
-    # SAP returns. It is not a skip (the primary cell has data), so it lands
-    # silently in the "unmatched" bucket and reads as a SAP data problem
-    # rather than a half-filled input row. Name it instead.
+    # Say how many rows were dropped for a PARTIAL key specifically -- those
+    # look like usable rows to the operator, so silently folding them into
+    # the skip count would hide a half-filled sheet.
     if len(ordered_cols) > 1:
         partial = [
             i for i in range(n_rows)
-            if not skip_flags[i]
-            and normalize_key(key_vals[primary_col][i])
-            and any(not normalize_key(key_vals[c][i]) for c in ordered_cols)
+            if skip_flags[i] and not _is_skip_key_cell(key_vals[primary_col][i])
         ]
         if partial:
             blank_cols = sorted({
                 c for c in ordered_cols for i in partial
-                if not normalize_key(key_vals[c][i])
+                if _is_skip_key_cell(key_vals[c][i])
             })
             _log(on_event,
-                 f"WARNING: {len(partial)} row(s) have column "
+                 f"note: {len(partial)} row(s) have column "
                  f"{_col_letter(primary_col)} filled but column(s) "
-                 f"{', '.join(_col_letter(c) for c in blank_cols)} blank, so "
-                 f"their composite key is {excel_keys[partial[0]]!r} -- it can "
-                 f"never match a SAP row and will be reported as unmatched. "
-                 f"Fill the missing key column(s) for those rows.", "warn")
+                 f"{', '.join(_col_letter(c) for c in blank_cols)} blank -- "
+                 f"skipped, since a complete key needs every one of "
+                 f"{[_col_letter(c) for c in ordered_cols]}. Rows with a "
+                 f"complete key are unaffected.")
 
     unique_paste_values: list[str] = []
     seen: set[str] = set()
