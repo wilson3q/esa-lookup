@@ -367,7 +367,8 @@ exactly as they were).
 ## How to use -- 3 actions
 
 1. Log into SAP GUI and open the workbook in Excel (or know its path).
-2. Run the **Setup** cell below once. Nothing to read or change in it.
+2. Run the **Setup** cell first. Nothing to read or change in it, and
+   running it again is always harmless.
 3. Run YOUR process cell: **TO Number Process** or **Notification Number
    Process**. A message box reports each step: **OK** = continue,
    **Cancel** = stop with the workbook untouched.
@@ -387,13 +388,14 @@ Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 """),
 
     md("""\
-## Setup -- run this cell once, then go to your process
+## Setup -- always run this cell first
 
 The code both processes share (Excel read/write, SAP scripting, the step
-runner). **Nothing in here needs reading or editing.** Run it once after
-opening the notebook or restarting the kernel. It is auto-generated from
-the app's source files by `build_notebook.py`; to change behavior, change
-those files and regenerate. Do not hand-edit this notebook.
+runner). **Nothing in here needs reading or editing.** Just run it, then go
+to your process below. Running it again at any time is harmless. It is
+auto-generated from the app's source files by `build_notebook.py`; to
+change behavior, change those files and regenerate. Do not hand-edit this
+notebook.
 """),
     code(IMPORTS
          + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
