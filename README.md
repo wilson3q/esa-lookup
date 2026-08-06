@@ -386,9 +386,30 @@ Two notes for anyone extending these, both learned the hard way:
 
 ## Files
 
-- `esa_lookup.py` - tkinter GUI entry point
-- `sap_ops.py`    - SAP GUI Scripting helpers
-- `excel_ops.py`  - Excel COM helpers (bulk read/write)
-- `pipeline.py`   - workflow orchestrator + key-normalization helpers
-- `build.ps1`     - build a standalone `dist\esa-lookup.exe`
-- `tests/`        - COM-stubbed pytest suite (runs anywhere)
+- `esa_lookup.py`      - tkinter GUI entry point
+- `sap_ops.py`         - SAP GUI Scripting helpers
+- `excel_ops.py`       - Excel COM helpers (bulk read/write)
+- `pipeline.py`        - workflow orchestrator + key-normalization helpers
+- `esa_lookup.ipynb`   - **generated** self-contained notebook (see below)
+- `build_notebook.py`  - regenerates `esa_lookup.ipynb` from the .py sources
+- `build.ps1`          - build a standalone `dist\esa-lookup.exe`
+- `tests/`             - COM-stubbed pytest suite (runs anywhere)
+
+### The notebook is generated -- regenerate it after every code change
+
+`esa_lookup.ipynb` is not hand-written. It inlines `pipeline.py`,
+`excel_ops.py`, and `sap_ops.py` into one self-contained notebook, and it is
+what the ESA developers download and run. **A fix that lands only in the .py
+files does not reach them.** After changing any of the three sources:
+
+```powershell
+python build_notebook.py
+```
+
+then commit the regenerated `esa_lookup.ipynb` alongside your source change.
+`tests/test_notebook_sync.py` fails if you forget.
+
+Two things the builder cannot do for you: all three modules are flattened
+into one namespace, so a **new top-level name that collides** across modules
+will silently shadow; and `attach`/`save` are renamed by an explicit map in
+`build_notebook.py`, so **renaming those** needs the map updated too.

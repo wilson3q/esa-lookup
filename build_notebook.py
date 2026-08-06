@@ -164,37 +164,56 @@ def print_event(kind: str, payload) -> None:
 
 CONFIG_CELL = """\
 # ---- EDIT THIS -----------------------------------------------------------
-WORKFLOW = "TO"   # "TO" or "NOTIF"
-DRY_RUN = False   # True = run all SAP lookups + report match counts, but
-                  # leave the workbook completely untouched
+WORKFLOW = "TO"    # "TO" or "NOTIF"
+DRY_RUN = False    # True = run all SAP lookups + report match counts, but
+                   # leave the workbook completely untouched
+DIAGNOSE = False   # True = process nothing; just read the ZTBV selection
+                   # screens for WORKFLOW and print which S<n> filter is
+                   # which. No Excel file needed, no query executed,
+                   # nothing written. Use this when a run stops with
+                   # "Could not resolve the ... filter".
+
+# ZTBV names its filters generically (S3, S15, S29), so a filter the app
+# does not already know has to be found by the label beside it. If DIAGNOSE
+# told you the slot, pin it here and it will be used for every run below.
+# Example:  FILTER_OVERRIDES = {("Z50CFG_ENG_CRNT", "TO_NUMBER"): "S7"}
+FILTER_OVERRIDES = {}
 # --------------------------------------------------------------------------
-
-# Native file-picker (same widget the .py GUI uses, via tkinter). Skip
-# manual path-editing -- browse to the workbook you want to process.
-import tkinter as tk
-from tkinter import filedialog
-
-_picker_root = tk.Tk()
-_picker_root.withdraw()
-_picker_root.attributes("-topmost", True)
-try:
-    EXCEL_PATH = filedialog.askopenfilename(
-        title="Select the Excel workbook to process",
-        filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
-                   ("All files", "*.*")],
-    )
-finally:
-    _picker_root.destroy()
-
-if not EXCEL_PATH:
-    raise SystemExit("No file selected -- aborting. Re-run this cell to retry.")
 
 if WORKFLOW not in ("TO", "NOTIF"):
     raise SystemExit(f"WORKFLOW must be 'TO' or 'NOTIF', got {WORKFLOW!r}")
 
+for _key, _slot in FILTER_OVERRIDES.items():
+    PUSH_BUTTONS[_key] = push_button_id(_slot)
+    print(f"filter pinned: {_key[0]}.{_key[1]} -> {_slot}")
+
+EXCEL_PATH = ""
+if not DIAGNOSE:
+    # Native file-picker (same widget the .py GUI uses, via tkinter). Skip
+    # manual path-editing -- browse to the workbook you want to process.
+    import tkinter as tk
+    from tkinter import filedialog
+
+    _picker_root = tk.Tk()
+    _picker_root.withdraw()
+    _picker_root.attributes("-topmost", True)
+    try:
+        EXCEL_PATH = filedialog.askopenfilename(
+            title="Select the Excel workbook to process",
+            filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
+                       ("All files", "*.*")],
+        )
+    finally:
+        _picker_root.destroy()
+
+    if not EXCEL_PATH:
+        raise SystemExit(
+            "No file selected -- aborting. Re-run this cell to retry.")
+
 print(f"Workflow:    {WORKFLOW}")
 print(f"Dry run:     {DRY_RUN}")
-print(f"Excel file:  {EXCEL_PATH}")
+print(f"Diagnose:    {DIAGNOSE}")
+print(f"Excel file:  {EXCEL_PATH or '(not needed for DIAGNOSE)'}")
 """
 
 EXECUTE_CELL = """\
@@ -203,6 +222,7 @@ cfg = RunConfig(
     workflow=WORKFLOW,
     stop_event=threading.Event(),
     dry_run=DRY_RUN,
+    diagnose=DIAGNOSE,
 )
 run(cfg, on_event=print_event)
 """
@@ -245,8 +265,8 @@ then run `py build_notebook.py`. Do not hand-edit this notebook.
 Mass-lookup SAP data into an Excel workbook via transaction **ZTBV**,
 plant **ESA1**. Two workflows:
 
-- **TO** (3 steps): K → LTAP → M ; N+O → Z50CFG_ENG_CRNT → C/D/E + A + P ;
-  C → Z50CFG_ENG_VALD → F..I
+- **TO** (3 steps): K → LTAP → M ; K → Z50CFG_ENG_CRNT → C/D/E + A + N + O
+  + P ; C → Z50CFG_ENG_VALD → F..I
 - **NOTIF** (2 steps): A → Z50CFG_ENG_CRNT → C/D/E ; C → Z50CFG_ENG_VALD
   → F..I + LID to J
 
@@ -261,6 +281,17 @@ plant **ESA1**. Two workflows:
 1. Log into SAP GUI (any session; the script attaches to the first one).
 2. Cell → Run All. The config cell shows a **Browse** dialog to pick
    the workbook; Excel will auto-open it if it is not already open.
+
+If a run stops with **"Could not resolve the ... filter"**, set
+`DIAGNOSE = True` in the config cell and Run All again. That prints every
+filter on the ZTBV selection screen with its label, so you can see which
+`S<n>` slot the field lives in, then pin it via `FILTER_OVERRIDES` in the
+same cell. Diagnose needs SAP only — no workbook, no query, nothing written.
+
+If a step fails partway, the steps that already completed **are written and
+saved**; the failed step and everything after it leave their columns alone.
+The log says `WRITTEN` / `NOT RUN` per step. Re-running afterwards completes
+the sheet.
 
 Per-run logs land in `%LOCALAPPDATA%\\esa-lookup\\logs\\` (last 20 runs
 retained).
@@ -282,8 +313,10 @@ Key normalization, workflow definitions, orchestrator, and the per-run
 file-log subsystem. All 10 notebook-parity fixes present.
 
 **Gen 4:** steps chain in memory (`VirtualSheet`) and the workbook is
-written once, in a single final pass -- a SAP failure or Stop leaves the
-file untouched.
+written once, in a single final pass. Nothing is written until every SAP
+lookup is done, so a run can never leave a half-written column; if a step
+fails, the steps that completed before it are written and the rest are left
+as they were.
 """),
     code(rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))),
 
@@ -304,6 +337,9 @@ emits.
 Set `WORKFLOW` below (`\"TO\"` or `\"NOTIF\"`), then run the cell. A native
 Windows file-picker dialog pops up so you can browse to the Excel workbook.
 Cancel the dialog to abort.
+
+Set `DIAGNOSE = True` to skip the workbook entirely and just dump the ZTBV
+selection screens (see *How to run* at the top).
 
 > If the dialog does not appear on top, look for it in the taskbar — some
 > Jupyter front-ends push new native windows behind the browser.
