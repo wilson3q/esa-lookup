@@ -10,8 +10,10 @@ chain **in memory** (e.g. TO step 3 keys off the OBJNR values step 2 just
 fetched, not off column C in the sheet); the workbook is then written
 **once**, at the end. Consequences:
 
-- A failure or Stop during the SAP phase leaves the workbook **completely
-  untouched** -- no more partially-updated files.
+- Nothing is written until the SAP phase is over, so a run can never leave
+  a half-written column. **Stop** writes nothing at all. A *failure* writes
+  the steps that already completed and leaves the rest of the columns as
+  they were -- see [What happens when a step fails](#what-happens-when-a-step-fails).
 - Large runs are faster: 1 bulk key-read + 1 bulk write total instead of
   a write+re-read round-trip between every step.
 - Output columns, matching rules, and preserve/clear semantics are
@@ -66,6 +68,28 @@ pip install -r requirements.txt
    **Notification Number process**, click **Run** (tick **Dry run** first
    if you only want a match report without writing anything)
 
+There is also a **Diagnose** button. It reads the ZTBV selection screens for
+the chosen process and logs what it finds -- no Excel file needed, no query
+run, nothing written. Use it when a run stops with *"Could not resolve the
+... filter"*; see [Troubleshooting](#troubleshooting).
+
+## What happens when a step fails
+
+Each step writes its own block of columns, and steps run in order. If a step
+fails, the steps that **already completed are written and saved**, and the
+failed step plus everything after it leave their columns exactly as they
+were. The log names both sets:
+
+```
+WRITTEN  step 1 (LTAP): columns M -- 3 matched / 0 unmatched
+NOT RUN  step 2 (Z50CFG_ENG_CRNT): columns C, D, E, A, N, O, P left as they were
+```
+
+Re-running after a failure is safe: every step rewrites its own columns from
+scratch, so a partially-filled sheet is completed rather than corrupted.
+
+Pressing **Stop** is different -- an explicit cancel writes nothing at all.
+
 ## Workflows
 
 ### TO Number process (3 steps)
@@ -107,6 +131,31 @@ exported file.
   run still works via the clipboard; to fix the import path, check that
   native dialogs are Off, or record the import once with the Script
   Recorder and adjust `fill_multi_value_filter_from_file` in `sap_ops.py`.
+- **"Could not resolve the `<FIELD>` filter on `<TABLE>`"** - ZTBV names its
+  select-options generically (`S3`, `S15`, `S29`), so a filter that is not
+  already recorded in `PUSH_BUTTONS` has to be identified by the label
+  printed beside it on the selection screen. This error means zero or
+  several labels matched, and the app refuses to guess -- pasting keys into
+  the wrong filter returns confidently wrong data, which is worse than
+  stopping. To fix it:
+  1. Click **Diagnose**. It lists every `S<n>` on that screen with its
+     label and tooltip, and dumps a full per-control inventory to the log
+     file. Read off which `S<n>` is the field you need.
+  2. Pin it **without a rebuild** by setting an environment variable, then
+     re-run:
+     ```powershell
+     $env:ESA_LOOKUP_PUSH_Z50CFG_ENG_CRNT_TO_NUMBER = "S7"
+     ```
+     The name is `ESA_LOOKUP_PUSH_<TABLE>_<FIELD>`, uppercased, with any
+     non-alphanumeric character replaced by `_`. The value is the bare
+     `S<n>` (or a full control id).
+  3. To make it permanent, add it to `PUSH_BUTTONS` in `sap_ops.py`:
+     ```python
+     ("Z50CFG_ENG_CRNT", "TO_NUMBER"): push_button_id("S7"),
+     ```
+  If every label in the Diagnose output reads `(no label found)`, send the
+  log **file** -- it carries the raw control dump with the coordinates and
+  tooltips needed to work out the mapping.
 - **Fewer matches than expected** - your ALV layout is probably missing a
   key column; edit and re-save the layout, then re-run.
 - **"WARNING: sent N unique key(s) to SAP but only M matched"** - shown
@@ -316,10 +365,24 @@ python -m pytest
 ```
 
 Covered: key normalization + lookup building (`tests/test_keys.py`), the
-Gen 4 in-memory column resolver (`tests/test_virtual_sheet.py`), and both
-workflows end-to-end against a fake SAP/Excel -- including failure
-atomicity, chunking, 0-row results, truncated exports, the clipboard
-fallback, and dry run (`tests/test_workflow_e2e.py`).
+Gen 4 in-memory column resolver (`tests/test_virtual_sheet.py`), reading
+the `S<n>` -> field mapping off the selection screen
+(`tests/test_selection_screen.py`), and both workflows end-to-end against a
+fake SAP/Excel -- including partial-write-on-failure, chunking, 0-row
+results, truncated exports, the clipboard fallback, and dry run
+(`tests/test_workflow_e2e.py`).
+
+Two notes for anyone extending these, both learned the hard way:
+
+- `tests/conftest.py` monkeypatches `sap_ops.resolve_push_button`, so the
+  end-to-end tests do **not** exercise filter resolution. That path is
+  covered only by `tests/test_selection_screen.py`.
+- The fakes in `test_selection_screen.py` carry both coordinate systems
+  (`CharTop`/`CharLeft` and `Top`/`Left`), with each label's pixel `Top`
+  deliberately offset from the button beside it. An earlier fake gave them
+  identical `Top` values, which made a broken pairing look correct -- the
+  suite stayed green while every filter on the customer's screen came back
+  `(no label found)`.
 
 ## Files
 

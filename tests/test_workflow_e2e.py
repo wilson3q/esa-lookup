@@ -64,22 +64,83 @@ class TestNotifWorkflow:
 
 
 class TestFailureAtomicity:
-    def test_sap_error_leaves_sheet_untouched(self, env):
+    """A failed step must not cost you the steps that already succeeded.
+
+    Gen 4 originally discarded every write when any step failed. That threw
+    away correct work -- a run whose step 1 matched every row still left the
+    workbook untouched because step 2 could not find its SAP filter. The
+    contract now: completed steps are written and saved, steps that failed or
+    never ran leave their columns exactly as they were, and the log says
+    which is which.
+    """
+
+    def test_sap_error_writes_the_completed_steps_only(self, env):
         env.grid = make_to_grid()
         env.fail_table = "Z50CFG_ENG_VALD"      # last step fails
         ok, logs = env.run("TO")
         assert not ok
-        assert env.grid == make_to_grid()
         assert "simulated SAP error" in logs
-        assert "NOT modified" in logs
 
-    def test_truncated_export_aborts_before_write(self, env):
+        # steps 1 and 2 completed -> their columns are written
+        env.assert_cells({
+            (2, 13): "DockA", (3, 13): "DockB",         # M   (step 1)
+            (2, 3): "OBJ1", (3, 3): "OBJ2",             # C   (step 2)
+            (2, 4): "MAT1", (2, 5): 5,                  # D,E (step 2)
+            (2, 1): "QN1", (3, 1): "QN2",               # A   (step 2 extra)
+            (2, 16): "T001", (3, 16): "T002",           # P   (step 2 audit)
+        })
+        # step 3 never ran -> F..I stay empty, J keeps its prior content
+        for col in (6, 7, 8, 9):
+            assert (2, col) not in env.grid and (3, col) not in env.grid
+        assert env.grid[(2, 10)] == "keepJ2"
+        assert env.grid[(3, 10)] == "keepJ3"
+        assert "WRITTEN  step 1" in logs and "WRITTEN  step 2" in logs
+        assert "NOT RUN  step 3" in logs
+
+    def test_truncated_export_writes_only_the_completed_step(self, env):
         env.grid = make_to_grid()
-        env.truncate_tables.add("Z50CFG_ENG_CRNT")
+        env.truncate_tables.add("Z50CFG_ENG_CRNT")   # step 2 fails
+        seed = make_to_grid()
+        ok, logs = env.run("TO")
+        assert not ok
+        assert "row-count mismatch" in logs
+        # exactly step 1's column M changed; nothing else moved
+        changed = {k: v for k, v in env.grid.items() if seed.get(k) != v}
+        assert changed == {(2, 13): "DockA", (3, 13): "DockB"}
+        # step 2's own key column keeps the sentinel garbage it started with
+        assert env.grid[(2, 3)] == "STALE1"
+
+    def test_failure_in_the_first_step_writes_nothing(self, env):
+        env.grid = make_to_grid()
+        env.fail_table = "LTAP"
         ok, logs = env.run("TO")
         assert not ok
         assert env.grid == make_to_grid()
-        assert "row-count mismatch" in logs
+        assert "NOT modified" in logs
+
+    def test_dry_run_writes_nothing_even_when_a_later_step_fails(self, env):
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"
+        ok, _ = env.run("TO", dry_run=True)
+        assert not ok
+        assert env.grid == make_to_grid()
+
+    def test_salvaged_run_is_saved(self, env):
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"
+        ok, _ = env.run("TO")
+        assert not ok
+        assert ("write", "SAVE") in env.events
+
+    def test_rerunning_after_a_salvage_completes_the_sheet(self, env):
+        """Salvage must leave a workbook a re-run can finish, not a mess."""
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"
+        assert not env.run("TO")[0]
+        env.fail_table = None
+        ok, logs = env.run("TO")
+        assert ok, logs
+        env.assert_cells(EXPECTED_TO)
 
     def test_stop_before_run_leaves_sheet_untouched(self, env):
         env.grid = make_to_grid()

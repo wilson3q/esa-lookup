@@ -1260,13 +1260,90 @@ def _write_back(
          "ok")
 
 
+def _step_columns(step: LookupStep) -> list[str]:
+    """Every Excel column a step writes, as letters, in write order."""
+    cols = [_col_letter(c) for c in step.excel_output_columns]
+    cols += [_col_letter(e.excel_col) for e in step.extras]
+    if step.match_key_column is not None:
+        cols.append(_col_letter(step.match_key_column))
+    return cols
+
+
+def _salvage_completed_steps(
+    results: list[StepResult],
+    steps: list[LookupStep],
+    xl,
+    on_event: EventFn,
+    write_state: str,
+    dry_run: bool,
+) -> str:
+    """A step failed. Write the steps that DID complete, and say plainly
+    which columns are filled and which are not.
+
+    Gen 4 originally discarded everything on any failure. That is the safest
+    rule but it also threw away work that was already correct -- a run whose
+    step 1 matched every row still left the workbook untouched because step 2
+    could not find its SAP filter. Steps write disjoint column blocks and
+    `results` only ever holds a PREFIX of the workflow (a step that fails
+    stops the ones after it, which is also what feeds them their keys), so
+    applying that prefix is exactly what a successful run would have written
+    for those steps.
+
+    Returns the new write_state. Never raises: a failure to salvage must not
+    replace the original error, which is the one worth reporting.
+    """
+    if dry_run or not results or xl is None:
+        return write_state
+    if write_state != "none":
+        # The failure was already inside the final write-back; re-running it
+        # would double-apply. Leave it to the 'partial' warning.
+        return write_state
+
+    done = {res.step_index for res in results}
+    missing = [(i, s) for i, s in enumerate(steps) if i not in done]
+    try:
+        _log(on_event,
+             f"salvage: {len(results)} of {len(steps)} step(s) completed "
+             f"before the failure -- writing those, leaving the rest alone",
+             "warn")
+        _write_back(results, xl, on_event, len(steps))
+        try:
+            excel_ops.save(xl.book)
+        except excel_ops.ExcelError as e:
+            _log(on_event, f"WARNING: {e}", "warn")
+        for res in results:
+            _log(on_event,
+                 f"  WRITTEN  step {res.step_index + 1} "
+                 f"({res.step.sap_table}): columns "
+                 f"{', '.join(_step_columns(res.step))} -- "
+                 f"{res.matched} matched / {res.unmatched} unmatched", "ok")
+        for i, s in missing:
+            _log(on_event,
+                 f"  NOT RUN  step {i + 1} ({s.sap_table}): columns "
+                 f"{', '.join(_step_columns(s))} left as they were", "warn")
+        return "salvaged"
+    except Exception as e:
+        _log(on_event,
+             f"WARNING: could not write the completed steps either ({e}). "
+             f"The workbook may be partially updated -- review it before "
+             f"saving.", "warn")
+        _file_log_traceback()
+        return "partial"
+
+
 def _log_write_state(on_event: EventFn, write_state: str) -> None:
     """After a cancel/failure, tell the user exactly what state the file is
-    in. Gen 4 defers all writes, so the common case is 'untouched'."""
+    in."""
     if write_state == "none":
         _log(on_event,
-             "the workbook was NOT modified (all writes are deferred until "
-             "every SAP step succeeds)", "info")
+             "the workbook was NOT modified (no step completed before the "
+             "failure)", "info")
+    elif write_state == "salvaged":
+        _log(on_event,
+             "the workbook holds the completed steps ONLY (see WRITTEN / "
+             "NOT RUN above) and has been saved. Fix the failure and re-run "
+             "to fill the rest -- re-running is safe, every step rewrites "
+             "its own columns from scratch.", "warn")
     elif write_state == "partial":
         _log(on_event,
              "WARNING: failure happened DURING the final write-back -- the "
@@ -1279,10 +1356,7 @@ def _dry_run_report(results: list[StepResult], on_event: EventFn) -> None:
     _log(on_event, "DRY RUN -- the workbook will not be modified. Planned writes:")
     for res in results:
         step = res.step
-        cols = [_col_letter(c) for c in step.excel_output_columns]
-        cols += [_col_letter(e.excel_col) for e in step.extras]
-        if step.match_key_column is not None:
-            cols.append(_col_letter(step.match_key_column))
+        cols = _step_columns(step)
         _log(on_event,
              f"  step {res.step_index + 1} ({step.sap_table}): "
              f"{res.matched} matched / {res.unmatched} unmatched"
@@ -1299,12 +1373,92 @@ def _dry_run_report(results: list[StepResult], on_event: EventFn) -> None:
                 break
 
 
+def _diagnose(workflow: str, sap: sap_ops.SapSession, on_event: EventFn) -> None:
+    """Dump every ZTBV selection screen this workflow touches.
+
+    ZTBV's select-options are named generically (S3, S15, S29), so a filter
+    can only be identified by the label printed beside it. When that pairing
+    fails -- a screen built without GuiLabels, an unusual SAP GUI build --
+    the run dies with nothing to act on. This walks each table's screen and
+    logs BOTH the resolved filter list and the raw control inventory, so the
+    S<n> -> field mapping can be read by eye from the log file and pinned
+    with ESA_LOOKUP_PUSH_<TABLE>_<FIELD>.
+
+    Read-only: it navigates and reads. No filter is pasted, no query is
+    executed, and Excel is never opened.
+    """
+    tables: list[str] = []
+    for step in WORKFLOWS[workflow]:
+        if step.sap_table not in tables:
+            tables.append(step.sap_table)
+
+    _log(on_event,
+         f"DIAGNOSE: dumping the ZTBV selection screen for {len(tables)} "
+         f"table(s): {', '.join(tables)}. Nothing is pasted, executed, or "
+         f"written -- this only reads the screens.")
+
+    wanted_by_table: dict[str, list[str]] = {}
+    for step in WORKFLOWS[workflow]:
+        wanted_by_table.setdefault(step.sap_table, [])
+        if step.push_button_field not in wanted_by_table[step.sap_table]:
+            wanted_by_table[step.sap_table].append(step.push_button_field)
+
+    for table in tables:
+        _log(on_event, "")
+        _log(on_event, f"===== {table} =====")
+        sap_ops.open_ztbv_table(sap, table, log=lambda m: _log(on_event, m))
+        try:
+            filters = sap_ops.describe_selection_screen(sap)
+        except sap_ops.SapError as e:
+            _log(on_event, f"{table}: cannot read the selection screen: {e}",
+                 "error")
+            continue
+
+        _log(on_event, f"{table}: {len(filters)} multi-value filter(s)")
+        for f in filters:
+            _log(on_event,
+                 f"  {f['param']:<6} row={f['row']:<4} label={f['label']!r}"
+                 + (f"  tooltip={f['tooltip']!r}" if f["tooltip"] else ""))
+
+        # What this workflow actually needs off this screen, and whether it
+        # would resolve right now.
+        for field in wanted_by_table[table]:
+            try:
+                pid = sap_ops.resolve_push_button(sap, table, field)
+                _log(on_event, f"  -> {field} resolves to {pid}", "ok")
+            except sap_ops.SapError as e:
+                _log(on_event, f"  -> {field} DOES NOT RESOLVE: {e}", "error")
+                _log(on_event,
+                     f"     pin it with: set "
+                     f"{sap_ops.env_override_var(table, field)}=S<n>", "warn")
+
+        # Raw inventory -- the fallback when no label paired. Only text-bearing
+        # controls; the rest is noise for this purpose.
+        _file_log("info", f"--- {table}: raw control inventory ---")
+        try:
+            for it in sap_ops.screen_inventory(sap):
+                if not (it["text"] or it["tooltip"]):
+                    continue
+                _file_log("info",
+                          f"  {it['type']:<16} row={it['row']:<4} "
+                          f"col={it['col']:<4} name={it['name']!r} "
+                          f"text={it['text']!r} tooltip={it['tooltip']!r}")
+        except sap_ops.SapError as e:
+            _file_log("info", f"  inventory unavailable: {e}")
+
+    _log(on_event, "")
+    _log(on_event,
+         "DIAGNOSE complete. The full per-control dump is in the log FILE "
+         "(path echoed at the top) -- send that file on.", "ok")
+
+
 @dataclass
 class RunConfig:
     excel_path: str
     workflow: str            # "TO" or "NOTIF"
     stop_event: threading.Event
     dry_run: bool = False    # Item 4: fetch + report matches, write nothing
+    diagnose: bool = False   # dump SAP selection screens; touch nothing else
 
 
 def run(cfg: RunConfig, on_event: EventFn) -> bool:
@@ -1321,6 +1475,11 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     # exactly what happened to the file: "none" -> nothing written (fetch
     # phase), "partial" -> failure mid write-back, "done" -> fully written.
     write_state = "none"
+    # Declared up here so the failure handlers can salvage whatever the fetch
+    # phase managed to complete before it died.
+    xl = None
+    steps: list[LookupStep] = []
+    results: list[StepResult] = []
     try:
         _log(on_event, f"esa-lookup starting workflow '{cfg.workflow}'", "info")
         if log_path:
@@ -1336,6 +1495,18 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
                   f"env: Python {sys.version.split()[0]} on "
                   f"{sys.platform}, pandas {pd.__version__}, openpyxl {openpyxl_v}, "
                   f"cwd={os.getcwd()}, excel={cfg.excel_path}")
+
+        # Diagnose is SAP-only and read-only: no workbook is opened, so it
+        # runs even when the operator has no file picked.
+        if cfg.diagnose:
+            _status(on_event, "attaching to SAP GUI")
+            sap = sap_ops.attach()
+            _log(on_event, "attached to SAP GUI session", "ok")
+            _diagnose(cfg.workflow, sap, on_event)
+            _status(on_event, "diagnose complete -- nothing written")
+            _progress(on_event, 1.0)
+            on_event("done", True)
+            return True
 
         _status(on_event, "opening Excel")
         xl = excel_ops.attach(cfg.excel_path)
@@ -1371,7 +1542,6 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
 
         # ---- Phase 1: fetch every step from SAP (no workbook writes) ----
         vsheet = VirtualSheet(xl.sheet)
-        results: list[StepResult] = []
         totals_matched = 0
         totals_seen = 0
         for i, step in enumerate(steps):
@@ -1421,14 +1591,24 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         return True
 
     except Cancelled:
+        # Stop stays strictly all-or-nothing: the GUI promises the file will
+        # not be modified, and an explicit abort is not a partial result the
+        # operator asked to keep.
         _log(on_event, "cancelled by user", "warn")
-        _log_write_state(on_event, write_state)
+        if write_state == "none":
+            _log(on_event,
+                 "the workbook was NOT modified (Stop leaves the file "
+                 "untouched)", "info")
+        else:
+            _log_write_state(on_event, write_state)
         _status(on_event, "cancelled")
         on_event("done", False)
         return False
     except sap_ops.SapError as e:
         _log(on_event, f"SAP error: {e}", "error")
         _file_log_traceback()  # full chain into the log file for post-mortem
+        write_state = _salvage_completed_steps(
+            results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _status(on_event, "SAP error")
         on_event("done", False)
@@ -1436,6 +1616,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     except excel_ops.ExcelError as e:
         _log(on_event, f"Excel error: {e}", "error")
         _file_log_traceback()
+        write_state = _salvage_completed_steps(
+            results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _status(on_event, "Excel error")
         on_event("done", False)
@@ -1444,6 +1626,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"unexpected error: {e}", "error")
         _log(on_event, traceback.format_exc(), "error")
         _file_log_traceback()
+        write_state = _salvage_completed_steps(
+            results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _status(on_event, "failed")
         on_event("done", False)

@@ -181,6 +181,9 @@ class App:
         self.run_btn.pack(side="left", padx=(8, 0))
         self.stop_btn = ttk.Button(row3, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        self.diag_btn = ttk.Button(
+            row3, text="Diagnose", command=self._on_diagnose)
+        self.diag_btn.pack(side="left", padx=(8, 0))
         ttk.Checkbutton(
             row3, text="Dry run (report matches only, write nothing)",
             variable=self.dryrun_var,
@@ -189,6 +192,15 @@ class App:
             row3, style="Hint.TLabel",
             text="   Keep this window, SAP GUI, and Excel all visible while it runs.",
         ).pack(side="left", padx=(12, 0))
+        ttk.Label(
+            self.root, style="Hint.TLabel", justify="left", anchor="w",
+            text=("        'Diagnose' reads the ZTBV selection screens for the "
+                  "chosen Process and writes what it finds to the log.\n"
+                  "        Needs SAP only - no Excel file, no query is run, "
+                  "nothing is written. Use it when a run stops with\n"
+                  "        \"Could not resolve the ... filter\", then send the "
+                  "log file."),
+        ).pack(anchor="w", padx=12)
 
         # -- Status + progress ----------------------------------------------
         row4 = ttk.Frame(self.root)
@@ -241,14 +253,27 @@ class App:
             self._append_log(f"File does not exist:\n{path}", "error")
             return
 
-        self._clear_log()
-        self.stop_event = threading.Event()
-        cfg = pipeline.RunConfig(
+        self._launch(pipeline.RunConfig(
             excel_path=path,
             workflow=self.workflow_var.get(),
             stop_event=self.stop_event,
             dry_run=self.dryrun_var.get(),
-        )
+        ))
+
+    def _on_diagnose(self) -> None:
+        # Deliberately no file check: Diagnose never opens Excel, and the
+        # operator running it is usually blocked before picking a file.
+        self._launch(pipeline.RunConfig(
+            excel_path="",
+            workflow=self.workflow_var.get(),
+            stop_event=self.stop_event,
+            diagnose=True,
+        ))
+
+    def _launch(self, cfg) -> None:
+        self._clear_log()
+        self.stop_event = threading.Event()
+        cfg.stop_event = self.stop_event
         self._set_running(True)
         self.status_var.set("starting...")
         self.progress["value"] = 0
@@ -304,6 +329,7 @@ class App:
 
     def _set_running(self, running: bool) -> None:
         self.run_btn.state(["disabled"] if running else ["!disabled"])
+        self.diag_btn.state(["disabled"] if running else ["!disabled"])
         self.stop_btn.state(["!disabled"] if running else ["disabled"])
 
 

@@ -89,4 +89,8 @@ class TestRowCountGuard:
         ok, logs = env.run("TO")
         assert not ok
         assert "row-count mismatch" in logs
-        assert env.grid == seed, "workbook must be untouched on abort"
+        # The aborting step (2) must write nothing. Step 1 completed before
+        # it, so its column M is salvaged -- see TestFailureAtomicity.
+        changed = {k: v for k, v in env.grid.items() if seed.get(k) != v}
+        assert changed == {(2, 13): "DockA", (3, 13): "DockB"}, (
+            "only the completed step's column may change on abort")
