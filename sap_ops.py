@@ -93,6 +93,86 @@ def open_ztbv_table(s: SapSession, table: str, log=None) -> None:
     time.sleep(0.3)
 
 
+_VALU_PUSH_RE = re.compile(r"btn%_(.+?)_%_APP_%-VALU_PUSH")
+_SELOPT_INPUT_RE = re.compile(r"(S\d+)-(LOW|HIGH)$", re.I)
+
+
+def _attr(c, name: str, default: str = "") -> str:
+    try:
+        v = getattr(c, name)
+        return "" if v is None else str(v)
+    except Exception:
+        return default
+
+
+def _int_attr(c, name: str, default: int = -1) -> int:
+    try:
+        return int(getattr(c, name))
+    except Exception:
+        return default
+
+
+def _walk_controls(root, max_depth: int = 6) -> list:
+    """Every control under `root`, depth-first. Individual failures are
+    skipped -- a selection screen with one unreadable control should still
+    yield the other 200."""
+    out = []
+
+    def walk(node, depth):
+        if depth > max_depth:
+            return
+        try:
+            children = node.Children
+            count = int(children.Count)
+        except Exception:
+            return
+        for i in range(count):
+            try:
+                c = children(i)
+            except Exception:
+                continue
+            out.append(c)
+            walk(c, depth + 1)
+
+    walk(root, 0)
+    return out
+
+
+def screen_inventory(s, log=None) -> list[dict]:
+    """Flat dump of every control on wnd[0]/usr, with both coordinate systems.
+
+    This is the raw material for `describe_selection_screen` and for the
+    Diagnose run -- when label pairing fails, the inventory is what lets a
+    human map S<n> -> field by eye from the log file.
+    """
+    try:
+        usr = s.find("wnd[0]/usr")
+    except Exception as e:
+        raise SapError(f"No selection screen on wnd[0]/usr: {e}") from e
+
+    items = []
+    for c in _walk_controls(usr):
+        cid = _attr(c, "Id")
+        items.append({
+            "id": cid[cid.find("wnd[0]"):] if "wnd[0]" in cid else cid,
+            "type": _attr(c, "Type"),
+            "name": _attr(c, "Name"),
+            "text": _attr(c, "Text").strip(),
+            "tooltip": _attr(c, "Tooltip").strip(),
+            # Character metric: exact per dynpro row/column. Only meaningful
+            # for controls inside the user area -- which is all of these.
+            "row": _int_attr(c, "CharTop"),
+            "col": _int_attr(c, "CharLeft"),
+            # Pixel metric: the fallback when CharTop/CharLeft read as 0 on
+            # this SAP GUI build.
+            "ptop": _int_attr(c, "Top"),
+            "pleft": _int_attr(c, "Left"),
+        })
+    if log:
+        log(f"SAP: selection screen carries {len(items)} control(s)")
+    return items
+
+
 def describe_selection_screen(s, log=None) -> list[dict]:
     """List every multi-value ('=>' arrow) filter on the current ZTBV
     selection screen, with the on-screen label next to each one.
@@ -101,87 +181,108 @@ def describe_selection_screen(s, log=None) -> list[dict]:
     slot is which field cannot be inferred from the id alone, and guessing
     would paste values into the wrong filter and return confidently wrong
     data. Run this once against a table to read the mapping off the screen
-    instead of recording it by hand:
+    instead of recording it by hand.
 
-        import sap_ops
-        for f in sap_ops.describe_selection_screen(sap_ops.attach()):
-            print(f["param"], f["label"], f["push_id"], sep=" | ")
+    Pairing runs in CHARACTER metric (CharTop/CharLeft), not pixels. A
+    selection screen row reads [label] [LOW] [HIGH] [=> button], so the
+    field name is the nearest label to the LEFT on the SAME dynpro row.
+    Pixel `Top` was what the previous version used, and it does not agree
+    between a label and a push button drawn on one row -- every filter came
+    back unlabelled.
+
+    Only GuiLabel controls are treated as labels. The select-option input
+    fields on the same row are GuiTextField/GuiCTextField and hold retained
+    FILTER VALUES, so accepting them would let a leftover TO number pose as
+    a field name.
+
+    Each filter's `tooltip` (read off its own -LOW field) is carried as an
+    independent second source of the field's identity, used by
+    `resolve_push_button` only when no label matched.
 
     Call it AFTER open_ztbv_table(), while the selection screen is up.
-    Returns [{param, label, push_id, low_field}], one per filter.
+    Returns [{param, label, tooltip, push_id, low_field, row, col}].
     """
-    try:
-        usr = s.find("wnd[0]/usr")
-    except Exception as e:
-        raise SapError(f"No selection screen on wnd[0]/usr: {e}") from e
+    items = screen_inventory(s, log=None)
 
-    # Collect every control on the screen, then pair the multi-value push
-    # buttons with the label sitting on the same screen row.
-    controls = []
-    def walk(node, depth=0):
-        if depth > 4:
-            return
-        try:
-            children = node.Children
-        except Exception:
-            return
-        for i in range(children.Count):
-            try:
-                c = children(i)
-                controls.append(c)
-                walk(c, depth + 1)
-            except Exception:
-                continue
-    walk(usr)
+    # CharTop/CharLeft are 0 on some SAP GUI builds for some control types.
+    # Fall back to pixels wholesale rather than mixing the two metrics.
+    use_char = any(it["row"] > 0 for it in items)
+    row_of = (lambda it: it["row"]) if use_char else (lambda it: it["ptop"])
+    col_of = (lambda it: it["col"]) if use_char else (lambda it: it["pleft"])
+    # Row tolerance for the "near miss" pass: 1 dynpro row, or roughly one
+    # row of pixels when we are stuck in pixel metric.
+    row_slack = 1 if use_char else 12
 
-    def attr(c, name, default=""):
-        try:
-            v = getattr(c, name)
-            return "" if v is None else str(v)
-        except Exception:
-            return default
+    labels = [it for it in items if it["type"] == "GuiLabel" and it["text"]]
+    if not labels:
+        # No GuiLabel at all: widen to text controls that are NOT select-option
+        # inputs, so a screen built entirely from output fields still resolves.
+        # Noted in the log because these are a weaker signal than a real label.
+        labels = [
+            it for it in items
+            if it["text"]
+            and it["type"] in ("GuiTextField", "GuiCTextField")
+            and not _SELOPT_INPUT_RE.search(it["name"] or "")
+        ]
+        if labels and log:
+            log(f"SAP: no GuiLabel on this screen; falling back to "
+                f"{len(labels)} non-input text control(s) as label sources")
 
-    labels_by_top: dict[int, str] = {}
-    for c in controls:
-        if attr(c, "Type") in ("GuiLabel", "GuiTextField") and attr(c, "Text").strip():
-            try:
-                top = int(c.Top)
-            except Exception:
-                continue
-            txt = attr(c, "Text").strip()
-            # keep the leftmost label on that row -- that is the field name
-            if top not in labels_by_top or len(txt) > len(labels_by_top[top]):
-                labels_by_top[top] = txt
+    # Tooltip of each select-option's own -LOW field, keyed by S<n>.
+    tooltip_by_param: dict[str, str] = {}
+    low_field_by_param: dict[str, str] = {}
+    for it in items:
+        m = _SELOPT_INPUT_RE.search(it["name"] or "")
+        if not m or m.group(2).upper() != "LOW":
+            continue
+        param = m.group(1).upper()
+        low_field_by_param[param] = it["id"]
+        if it["tooltip"]:
+            tooltip_by_param[param] = it["tooltip"]
+
+    def label_for(btn) -> str:
+        brow, bcol = row_of(btn), col_of(btn)
+        same_row = [l for l in labels if abs(row_of(l) - brow) == 0]
+        left = [l for l in same_row if col_of(l) < bcol]
+        if left:
+            return max(left, key=col_of)["text"]
+        if same_row:
+            return min(same_row, key=col_of)["text"]
+        near = [l for l in labels if abs(row_of(l) - brow) <= row_slack]
+        if near:
+            return min(near, key=lambda l: (abs(row_of(l) - brow), -col_of(l)))["text"]
+        return ""
 
     out: list[dict] = []
-    for c in controls:
-        cid = attr(c, "Id")
-        if "VALU_PUSH" not in cid:
+    for it in items:
+        m = _VALU_PUSH_RE.search(it["id"])
+        if not m:
             continue
-        m = re.search(r"btn%_(.+?)_%_APP_%-VALU_PUSH", cid)
-        param = m.group(1) if m else "?"
-        try:
-            top = int(c.Top)
-        except Exception:
-            top = -1
-        label = labels_by_top.get(top, "")
-        if not label:
-            # fall back to the nearest label above this row
-            near = [t for t in labels_by_top if 0 <= top - t <= 2]
-            label = labels_by_top[max(near)] if near else "(no label found)"
-        entry = {
+        param = m.group(1).upper()
+        label = label_for(it)
+        tooltip = tooltip_by_param.get(param, "")
+        out.append({
             "param": param,
-            "label": label,
-            "push_id": cid[cid.find("wnd[0]"):] if "wnd[0]" in cid else cid,
-            "low_field": f"wnd[0]/usr/ctxt{param}-LOW",
-        }
-        out.append(entry)
+            "label": label or "(no label found)",
+            "tooltip": tooltip,
+            "push_id": it["id"],
+            "low_field": low_field_by_param.get(
+                param, f"wnd[0]/usr/ctxt{param}-LOW"),
+            "row": row_of(it),
+            "col": col_of(it),
+        })
         if log:
-            log(f"SAP: filter {param:<6} label={label!r}")
+            log(f"SAP: filter {param:<6} label={label or '(none)'!r}"
+                + (f" tooltip={tooltip!r}" if tooltip else ""))
     if not out:
         raise SapError(
             "No multi-value filter buttons found. Is the ZTBV selection "
             "screen actually displayed (call open_ztbv_table first)?")
+    if log:
+        named = sum(1 for f in out if f["label"] != "(no label found)")
+        log(f"SAP: {len(out)} filter(s) found, {named} with a label, "
+            f"{sum(1 for f in out if f['tooltip'])} with a tooltip "
+            f"({'character' if use_char else 'pixel'} metric)")
     return out
 
 
@@ -541,24 +642,60 @@ FIELD_LABEL_SYNONYMS = {
 }
 
 
+def push_button_id(param: str) -> str:
+    """S7 -> the full multi-value push button id for that select-option."""
+    return f"wnd[0]/usr/btn%_{param.upper()}_%_APP_%-VALU_PUSH"
+
+
+def env_override_var(table: str, field: str) -> str:
+    return "ESA_LOOKUP_PUSH_" + re.sub(
+        r"[^A-Z0-9]+", "_", f"{table}_{field}".upper())
+
+
+def _env_override(table: str, field: str) -> str | None:
+    """Read a (table, field) -> filter mapping out of the environment.
+
+    Lets whoever is standing at the customer's machine correct a mapping
+    without a rebuild-and-redistribute cycle:
+
+        set ESA_LOOKUP_PUSH_Z50CFG_ENG_CRNT_TO_NUMBER=S7
+
+    Accepts either the bare select-option name ("S7") or a full control id.
+    """
+    raw = (os.environ.get(env_override_var(table, field)) or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"S\d+", raw, re.I):
+        return push_button_id(raw)
+    return raw
+
+
 def resolve_push_button(s, table: str, field: str, log=None) -> str:
     """Return the multi-value push button id for (table, field).
 
-    Known combinations come straight from PUSH_BUTTONS. For a combination
-    not listed there, the CURRENTLY DISPLAYED selection screen is walked
-    (describe_selection_screen) and the filter whose on-screen label matches
-    the field's synonyms is chosen -- so a new table/field pairing costs a
-    label lookup at runtime instead of a Script Recorder session.
+    Resolution order:
+      1. An ESA_LOOKUP_PUSH_<TABLE>_<FIELD> environment override.
+      2. PUSH_BUTTONS, the recorded mappings.
+      3. The CURRENTLY DISPLAYED selection screen: the filter whose on-screen
+         label matches the field's synonyms, else -- only if no label matched
+         at all -- the filter whose tooltip does.
 
-    Exactly one label must match. Zero or several matches raise SapError
-    listing every filter on the screen, because pasting keys into the wrong
-    filter would return plausible-looking wrong data -- the one failure mode
-    worse than stopping.
+    Exactly one candidate must match. Zero or several raise SapError listing
+    every filter on the screen, because pasting keys into the wrong filter
+    would return plausible-looking wrong data -- the one failure mode worse
+    than stopping.
 
     A resolved id is cached into PUSH_BUTTONS for the rest of the process.
     Must be called AFTER open_ztbv_table() so the screen is displayed.
     """
     key = (table, field)
+    override = _env_override(table, field)
+    if override:
+        PUSH_BUTTONS[key] = override
+        if log:
+            log(f"SAP: {field} on {table} -> {override} "
+                f"(from {env_override_var(table, field)})")
+        return override
     if key in PUSH_BUTTONS:
         return PUSH_BUTTONS[key]
 
@@ -572,19 +709,34 @@ def resolve_push_button(s, table: str, field: str, log=None) -> str:
     filters = describe_selection_screen(s, log=log)
     hits = [f for f in filters
             if any(syn in f["label"].lower() for syn in synonyms)]
-    listing = "\n".join(
-        f"  {f['param']:<6} {f['label']!r}" for f in filters)
+    matched_on = "label"
+    if not hits:
+        # Tooltips are only consulted when no label matched -- consulting both
+        # at once would turn a clean single label hit into an ambiguity error.
+        hits = [f for f in filters
+                if any(syn in f["tooltip"].lower() for syn in synonyms)]
+        matched_on = "tooltip"
     if len(hits) != 1:
+        listing = "\n".join(
+            f"  {f['param']:<6} label={f['label']!r}"
+            + (f" tooltip={f['tooltip']!r}" if f["tooltip"] else "")
+            for f in filters)
         raise SapError(
             f"Could not resolve the {field} filter on {table}: "
-            f"{len(hits)} label(s) matched {synonyms}. Filters on this "
+            f"{len(hits)} candidate(s) matched {synonyms}. Filters on this "
             f"screen:\n{listing}\n"
-            f"Fix: add the right id to PUSH_BUTTONS[({table!r}, {field!r})] "
-            f"in sap_ops (the push_id column above is already in the "
-            f"required format).")
+            f"Fix (either one):\n"
+            f"  - set {env_override_var(table, field)}=S<n> in the "
+            f"environment and re-run -- no rebuild needed; or\n"
+            f"  - add PUSH_BUTTONS[({table!r}, {field!r})] = "
+            f"push_button_id('S<n>') in sap_ops.\n"
+            f"If every label above is '(no label found)', run the app's "
+            f"Diagnose button and send the log -- the raw screen dump names "
+            f"which S<n> is which.")
     resolved = hits[0]["push_id"]
     PUSH_BUTTONS[key] = resolved
     if log:
         log(f"SAP: resolved {field} on {table} -> {hits[0]['param']} "
-            f"(label {hits[0]['label']!r}) by on-screen label")
+            f"by on-screen {matched_on} "
+            f"({hits[0][matched_on]!r})")
     return resolved
