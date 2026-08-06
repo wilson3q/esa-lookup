@@ -193,31 +193,27 @@ WORKFLOWS = {
             excel_output_columns=[13],            # M
         ),
         LookupStep(
-            # ESA rework (2026-08): the original keyed this step on N|O
-            # (reservation number + item), which the operator had to fill by
-            # hand between steps. Per the ESA developers' demo, the same
-            # table answers a TO-number query directly -- Z50CFG_ENG_CRNT
-            # carries the TO pair and the reservation pair on one row -- so
-            # the step now keys on column K (already filled for step 1) and
-            # DERIVES the rest: QMNUM -> A, RSNUM -> N, RSPOS -> O. Rows
-            # whose TO number found no CRNT row are simply unmatched, same
-            # as the demo's pasted blanks being ignored by SAP.
-            name="Z50CFG_ENG_CRNT (TO Number) -> QMNUM/OBJNR/DISP",
+            # Keyed on the reservation pair, exactly like the ESA
+            # developer's own notebook (his code is the spec, 2026-08). A
+            # 2026-08 rework briefly keyed this on the TO number instead
+            # (905147d); reverted -- the reservation path is the one proven
+            # in the field, N/O are operator-provided inputs in the live
+            # workbook, and preserving A on non-match is what lets the
+            # NOTIF process later fill the notification-only rows (the
+            # either/or model: most rows have a notification but no TO).
+            name="Z50CFG_ENG_CRNT (Reservation) -> QMNUM/OBJNR/DISP",
             sap_table="Z50CFG_ENG_CRNT",
-            push_button_field="TO_NUMBER",
-            key_columns=[11],                     # K (same input as step 1)
-            sap_key_columns=["TANUM"],
+            push_button_field="RSNUM",
+            key_columns=[14, 15],                 # N | O
+            sap_key_columns=["RSNUM", "RSPOS"],
             sap_output_columns=["OBJNR", "DISP_MATNR", "DISP_QTY"],
             excel_output_columns=[3, 4, 5],       # C, D, E
             extras=[
-                # Notebook rule kept: A gets QMNUM on match but MUST NOT be
+                # Notebook rule: A gets QMNUM on match but MUST NOT be
                 # touched on non-match ("Do not touch Column A if there is
-                # no match"). N/O are now outputs (the derived reservation
-                # pair) -- also preserved on non-match so a hand-entered
-                # value is never clobbered by a miss.
+                # no match") -- the untouched rows carry the pre-existing
+                # notification numbers the NOTIF process keys on.
                 ExtraOutput(excel_col=1, sap_col="QMNUM", preserve_on_nonmatch=True),
-                ExtraOutput(excel_col=14, sap_col="RSNUM", preserve_on_nonmatch=True),
-                ExtraOutput(excel_col=15, sap_col="RSPOS", preserve_on_nonmatch=True),
             ],
             match_key_column=16,                  # P: audit-trail composite key
         ),

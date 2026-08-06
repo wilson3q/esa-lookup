@@ -141,13 +141,13 @@ def make_notif_grid() -> dict:
 EXPECTED_TO = {
     (2, 13): "DockA", (3, 13): "DockB",            # M
     (2, 1): "QN1", (3, 1): "QN2",                  # A: QMNUM derived on match
-    (2, 14): 100, (3, 14): 200,                    # N: RSNUM derived on match
-    (2, 15): 1, (3, 15): 2,                        # O: RSPOS derived on match
+    (2, 14): 100, (3, 14): 200,                    # N: input, untouched
+    (2, 15): 1, (3, 15): 2,                        # O: input, untouched
     (2, 3): "OBJ1", (3, 3): "OBJ2",                # C from step 2
     (2, 4): "MAT1", (2, 5): 5,                     # D, E
     (2, 6): "S1", (2, 7): "M1", (2, 8): "D1", (2, 9): "SO1",  # F..I
     (2, 10): "keepJ2", (3, 10): "keepJ3",          # J preserved on match
-    (2, 16): "T001", (3, 16): "T002",              # P audit key (TO-keyed)
+    (2, 16): "100|1", (3, 16): "200|2",            # P audit key (RSNUM|RSPOS)
     (1, 16): "Excel Match Key Used",
 }
 

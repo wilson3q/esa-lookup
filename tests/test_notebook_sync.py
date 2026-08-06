@@ -59,6 +59,7 @@ class TestNotebookCarriesTheCode:
         "def push_button_id(",
         "def _salvage_completed_steps(",
         "def _diagnose(",
+        "def screen_snapshot(",
         "CharTop",                      # the label-pairing fix
         "ESA_LOOKUP_PUSH_",             # the no-rebuild filter override
     ])
@@ -68,14 +69,28 @@ class TestNotebookCarriesTheCode:
     def test_old_pixel_pairing_is_gone(self, committed):
         assert not any("labels_by_top" in s for s in _cell_sources(committed))
 
-    def test_diagnose_is_reachable_from_the_config_cell(self, committed):
+    def test_process_cells_carry_the_operator_interface(self, committed):
+        """The ESA operator thinks in processes, not in framework parts:
+        one runnable cell per process, a one-line POPUPS switch, and real
+        message boxes -- the interface that persuaded them off the old
+        per-cell notebook. If these disappear, the notebook has regressed
+        to machinery-first."""
         code = _cell_sources(committed)
-        assert any("DIAGNOSE = False" in s for s in code), \
-            "config cell must expose a DIAGNOSE switch"
-        assert any("diagnose=DIAGNOSE" in s for s in code), \
-            "execute cell must pass diagnose through to RunConfig"
-        assert any("FILTER_OVERRIDES" in s for s in code), \
-            "config cell must let a filter slot be pinned without a rebuild"
+        assert any('run_process("TO"' in s for s in code)
+        assert any('run_process("NOTIF"' in s for s in code)
+        assert sum("POPUPS = True" in s for s in code) >= 2, \
+            "each process cell needs its own one-line popup switch"
+        assert any("MessageBoxW" in s for s in code), \
+            "popups must be real Windows message boxes, not prints"
+        assert any("diagnose=True" in s for s in code), \
+            "the troubleshooting cell must expose Diagnose"
+
+    def test_process_boundaries_are_markdown_headings(self, committed):
+        md = _cell_sources(committed, kind="markdown")
+        assert any(s.startswith("# TO Number Process") for s in md)
+        assert any(s.startswith("# Notification Number Process") for s in md)
+        # the engine must announce itself as skippable machinery
+        assert any("run once" in s.lower() for s in md)
 
     def test_module_qualified_refs_are_rewritten(self, committed):
         """Everything is inlined into one namespace, so `sap_ops.foo(...)`

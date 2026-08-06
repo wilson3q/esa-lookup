@@ -16,8 +16,10 @@ What it does:
   `excel_save` so they can coexist in one module namespace
 - Rewrites `excel_ops.X` / `sap_ops.X` call sites everywhere to bare
   identifiers so the code runs after inlining
-- Adds a notebook-only `print_event` handler + tkinter file-picker
-  config cell + a final `run()` execute cell
+- Assembles ONE collapsible "Engine" cell (imports + all three modules +
+  a message-box event handler + `run_process()`), then one runnable cell
+  per process: "# TO Number Process" and "# Notification Number Process"
+  -- the shape the ESA operator's own notebook used
 
 If any of the source .py files gain a NEW function or dataclass, it
 automatically shows up in the regenerated notebook -- no builder edit
@@ -144,103 +146,150 @@ import win32com.client
 from win32com.client import constants  # noqa: F401 (loaded lazily by pywin32)
 """
 
-PRINT_EVENT = """\
-def print_event(kind: str, payload) -> None:
-    \"\"\"Simple stdout event handler for notebook use. Same (kind, payload)
-    contract the .py app's tkinter callback receives.
+ENGINE_TAIL = """\
+# ---------------------------------------------------------------------------
+# Notebook front end: message boxes + run_process(), the ONLY function the
+# process cells call. Everything above this line is shared machinery.
+# ---------------------------------------------------------------------------
 
-    Popup events (the GUI's message boxes) are printed as banners and
-    auto-acknowledged with OK, so a notebook run never blocks on a dialog
-    nobody can click.\"\"\"
-    if kind == "log":
-        msg, level = payload
-        prefix = {"ok": "[OK]  ", "warn": "[WARN]", "error": "[ERR] ",
-                  "info": "      "}.get(level, "      ")
-        print(f"{prefix} {msg}")
-    elif kind == "status":
-        print(f"...    {payload}")
-    elif kind == "progress":
-        pass  # too noisy for stdout
-    elif kind == "popup":
-        banner = "!" if payload.get("kind") == "error" else "-"
-        print(banner * 60)
-        print(f"[{payload.get('kind', 'info').upper()}] {payload['title']}")
-        print(payload["message"])
-        print(banner * 60)
-        if payload.get("ack") is not None:
-            if payload.get("result") is not None:
-                payload["result"]["proceed"] = True
-            payload["ack"].set()
-    elif kind == "done":
-        ok = payload
-        print(f"===== workflow {'succeeded' if ok else 'FAILED'} =====")
-"""
+_MB_OKCANCEL, _MB_ICONERROR, _MB_ICONINFO, _MB_TOPMOST = 0x1, 0x10, 0x40, 0x40000
 
-CONFIG_CELL = """\
-# ---- EDIT THIS -----------------------------------------------------------
-WORKFLOW = "TO"    # "TO" or "NOTIF"
-DRY_RUN = False    # True = run all SAP lookups + report match counts, but
-                   # leave the workbook completely untouched
-DIAGNOSE = False   # True = process nothing; just read the ZTBV selection
-                   # screens for WORKFLOW and print which S<n> filter is
-                   # which. No Excel file needed, no query executed,
-                   # nothing written. Use this when a run stops with
-                   # "Could not resolve the ... filter".
 
-# ZTBV names its filters generically (S3, S15, S29), so a filter the app
-# does not already know has to be found by the label beside it. If DIAGNOSE
-# told you the slot, pin it here and it will be used for every run below.
-# Example:  FILTER_OVERRIDES = {("Z50CFG_ENG_CRNT", "TO_NUMBER"): "S7"}
-FILTER_OVERRIDES = {}
-# --------------------------------------------------------------------------
+def _msgbox(title: str, message: str, flags: int) -> int:
+    \"\"\"The original notebook's ctypes message box. Returns the button id
+    (1 = OK, 2 = Cancel).\"\"\"
+    import ctypes
+    return ctypes.windll.user32.MessageBoxW(0, message, title, flags)
 
-if WORKFLOW not in ("TO", "NOTIF"):
-    raise SystemExit(f"WORKFLOW must be 'TO' or 'NOTIF', got {WORKFLOW!r}")
 
-for _key, _slot in FILTER_OVERRIDES.items():
-    PUSH_BUTTONS[_key] = push_button_id(_slot)
-    print(f"filter pinned: {_key[0]}.{_key[1]} -> {_slot}")
+def make_event_handler(popups: bool):
+    \"\"\"Log lines print into the cell output; popup events become real
+    Windows message boxes when popups=True, printed banners when False.
+    ERROR popups always box regardless -- they only appear when something is
+    wrong, which is exactly when the box is wanted.\"\"\"
+    boxes_possible = sys.platform == "win32"
 
-EXCEL_PATH = ""
-if not DIAGNOSE:
-    # Native file-picker (same widget the .py GUI uses, via tkinter). Skip
-    # manual path-editing -- browse to the workbook you want to process.
-    import tkinter as tk
-    from tkinter import filedialog
+    def on_event(kind, payload):
+        if kind == "log":
+            msg, level = payload
+            prefix = {"ok": "[OK]  ", "warn": "[WARN]", "error": "[ERR] ",
+                      "info": "      "}.get(level, "      ")
+            print(f"{prefix} {msg}")
+        elif kind == "status":
+            print(f"...    {payload}")
+        elif kind == "popup":
+            p = payload
+            banner = "!" if p.get("kind") == "error" else "-"
+            print(banner * 60)
+            print(f"[{p.get('kind', 'info').upper()}] {p['title']}")
+            print(p["message"])
+            print(banner * 60)
+            if p.get("ack") is not None:                     # step popup
+                proceed = True
+                if popups and boxes_possible:
+                    ret = _msgbox(p["title"], p["message"],
+                                  _MB_OKCANCEL | _MB_ICONINFO | _MB_TOPMOST)
+                    proceed = (ret == 1)
+                if p.get("result") is not None:
+                    p["result"]["proceed"] = proceed
+                p["ack"].set()
+            elif p.get("kind") == "error":
+                if boxes_possible:
+                    _msgbox(p["title"], p["message"],
+                            _MB_ICONERROR | _MB_TOPMOST)
+            elif popups and boxes_possible:
+                _msgbox(p["title"], p["message"],
+                        _MB_ICONINFO | _MB_TOPMOST)
+        elif kind == "done":
+            ok = payload
+            print(f"===== process {'succeeded' if ok else 'FAILED'} =====")
 
-    _picker_root = tk.Tk()
-    _picker_root.withdraw()
-    _picker_root.attributes("-topmost", True)
-    try:
-        EXCEL_PATH = filedialog.askopenfilename(
-            title="Select the Excel workbook to process",
-            filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
-                       ("All files", "*.*")],
-        )
-    finally:
-        _picker_root.destroy()
+    return on_event
 
-    if not EXCEL_PATH:
+
+def run_process(workflow: str, excel_path: str = "", popups: bool = True,
+                dry_run: bool = False, diagnose: bool = False) -> bool:
+    \"\"\"Run one process end to end.
+
+    workflow    "TO" or "NOTIF"
+    excel_path  full path to the workbook; "" opens a Browse dialog
+    popups      message box after each step (OK = continue, Cancel = stop).
+                One-line off switch in the process cell. Error boxes always
+                show regardless.
+    dry_run     look everything up, report counts, write nothing
+    diagnose    dump the ZTBV selection screens instead of processing
+                (no Excel file needed)
+    \"\"\"
+    if workflow not in WORKFLOWS:
         raise SystemExit(
-            "No file selected -- aborting. Re-run this cell to retry.")
+            f"workflow must be one of {list(WORKFLOWS)}, got {workflow!r}")
+    if not diagnose and not excel_path:
+        import tkinter as tk
+        from tkinter import filedialog
+        _root = tk.Tk()
+        _root.withdraw()
+        _root.attributes("-topmost", True)
+        try:
+            excel_path = filedialog.askopenfilename(
+                title="Select the Excel workbook to process",
+                filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
+                           ("All files", "*.*")],
+            )
+        finally:
+            _root.destroy()
+        if not excel_path:
+            print("No file selected -- nothing was run.")
+            return False
+    cfg = RunConfig(
+        excel_path=excel_path,
+        workflow=workflow,
+        stop_event=threading.Event(),
+        dry_run=dry_run,
+        diagnose=diagnose,
+        step_popups=popups,
+    )
+    return run(cfg, on_event=make_event_handler(popups))
 
-print(f"Workflow:    {WORKFLOW}")
-print(f"Dry run:     {DRY_RUN}")
-print(f"Diagnose:    {DIAGNOSE}")
-print(f"Excel file:  {EXCEL_PATH or '(not needed for DIAGNOSE)'}")
+
+print("Engine loaded. Now run your process cell below")
+print("(TO Number Process or Notification Number Process).")
 """
 
-EXECUTE_CELL = """\
-cfg = RunConfig(
-    excel_path=EXCEL_PATH,
-    workflow=WORKFLOW,
-    stop_event=threading.Event(),
-    dry_run=DRY_RUN,
-    diagnose=DIAGNOSE,
-)
-run(cfg, on_event=print_event)
+TO_CELL = """\
+# =========================================================
+# TO Number Process        (run the Engine cell first, once)
+# =========================================================
+POPUPS = True     # message box after each step (OK = continue, Cancel =
+                  # stop). ONE-LINE OFF SWITCH: set to False once the first
+                  # days have gone smoothly. Error boxes always show.
+DRY_RUN = False   # True = report match counts only, write nothing
+EXCEL_PATH = r""  # paste the workbook's full path here, or leave "" to browse
+
+run_process("TO", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
 """
 
+NOTIF_CELL = """\
+# =========================================================
+# Notification Number Process   (run the Engine cell first)
+# =========================================================
+POPUPS = True     # message box after each step -- same one-line switch
+DRY_RUN = False   # True = report match counts only, write nothing
+EXCEL_PATH = r""  # paste the workbook's full path here, or leave "" to browse
+
+run_process("NOTIF", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
+"""
+
+DIAGNOSE_CELL = """\
+# Only needed when a run stops with "Could not resolve the ... filter".
+# Reads the ZTBV selection screens for the chosen process and prints which
+# S<n> filter slot is which. No Excel file, no query, nothing written.
+# Send the log file it names.
+run_process("TO", diagnose=True)          # or "NOTIF"
+
+# If Diagnose names the right slot, pin it here and re-run your process --
+# example (uncomment and adjust):
+# PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "RSNUM")] = push_button_id("S15")
+"""
 
 # ---------------------------------------------------------------------------
 # Cell constructors
@@ -270,104 +319,87 @@ def code(source: str) -> dict:
 
 CELLS = [
     md("""\
-# esa-lookup (self-contained notebook)
+# esa-lookup -- TO Number & Notification Number processes
 
-**Auto-generated** from `pipeline.py` + `excel_ops.py` + `sap_ops.py` by
-`build_notebook.py`. To update after a code change: edit the .py file(s),
-then run `py build_notebook.py`. Do not hand-edit this notebook.
+Fills the GTF SS Database workbook from SAP (transaction **ZTBV**, plant
+**ESA1**). Same steps, same message boxes, and the same results as the
+original per-step notebook -- but each step runs as **one SAP query + one
+bulk Excel write**, so a full sheet takes seconds instead of minutes, the
+multi-select filter is cleared of leftovers before every paste, and the
+workbook is written **once, at the end** (never left half-filled: if a step
+fails, the completed steps are written and the rest of the columns are left
+exactly as they were).
 
-Mass-lookup SAP data into an Excel workbook via transaction **ZTBV**,
-plant **ESA1**. Two workflows:
+## How to use -- 3 actions
 
-- **TO** (3 steps): K → LTAP → M ; K → Z50CFG_ENG_CRNT → C/D/E + A + N + O
-  + P ; C → Z50CFG_ENG_VALD → F..I
-- **NOTIF** (2 steps): A → Z50CFG_ENG_CRNT → C/D/E ; C → Z50CFG_ENG_VALD
-  → F..I + LID to J
+1. Log into SAP GUI and open the workbook in Excel (or know its path).
+2. Run the **Engine** cell below **once** -- then collapse that section and
+   forget it.
+3. Run YOUR process cell: **TO Number Process** or **Notification Number
+   Process**. A message box reports each step: **OK** = continue,
+   **Cancel** = stop with the workbook untouched.
 
-## Prerequisites
+On a combined sheet run the **TO process FIRST**, then the Notification
+process -- the second pass fills the notification-only rows (usually most
+of the sheet).
 
-- Windows + **SAP GUI for Windows** + **Microsoft Excel** (desktop)
-- SAP GUI Scripting enabled (Options → Accessibility & Scripting)
-- Python 3.10+ with `pip install pandas openpyxl pywin32`
-
-## How to run
-
-1. Log into SAP GUI (any session; the script attaches to the first one).
-2. Cell → Run All. The config cell shows a **Browse** dialog to pick
-   the workbook; Excel will auto-open it if it is not already open.
-
-If a run stops with **"Could not resolve the ... filter"**, set
-`DIAGNOSE = True` in the config cell and Run All again. That prints every
-filter on the ZTBV selection screen with its label, so you can see which
-`S<n>` slot the field lives in, then pin it via `FILTER_OVERRIDES` in the
-same cell. Diagnose needs SAP only — no workbook, no query, nothing written.
-
-If a step fails partway, the steps that already completed **are written and
-saved**; the failed step and everything after it leave their columns alone.
-The log says `WRITTEN` / `NOT RUN` per step. Re-running afterwards completes
-the sheet.
-
-Per-run logs land in `%LOCALAPPDATA%\\esa-lookup\\logs\\` (last 20 runs
-retained).
+Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
+(last 20 kept). Attach it whenever reporting a problem.
 """),
-
-    md("## Imports"),
-    code(IMPORTS),
-
-    md("## Excel COM helpers *(inlined from `excel_ops.py`)*"),
-    code(rename_excel_ops(strip_header(read_py("excel_ops.py")))),
-
-    md("## SAP GUI scripting helpers *(inlined from `sap_ops.py`)*"),
-    code(rename_sap_ops(strip_header(read_py("sap_ops.py")))),
 
     md("""\
-## Pipeline core *(inlined from `pipeline.py`)*
+## Engine -- run once, then collapse
 
-Key normalization, workflow definitions, orchestrator, and the per-run
-file-log subsystem. All 10 notebook-parity fixes present.
-
-**Gen 4:** steps chain in memory (`VirtualSheet`) and the workbook is
-written once, in a single final pass. Nothing is written until every SAP
-lookup is done, so a run can never leave a half-written column; if a step
-fails, the steps that completed before it are written and the rest are left
-as they were.
+Everything both processes share: Excel bulk read/write, SAP GUI scripting,
+and the step runner. **Nothing in here needs reading or editing.** It is
+auto-generated from the app's source files by `build_notebook.py`; to change
+behavior, change those files and regenerate. Do not hand-edit this notebook.
 """),
-    code(rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))),
+    code(IMPORTS
+         + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
+         + "\n\n" + rename_sap_ops(strip_header(read_py("sap_ops.py")))
+         + "\n\n" + rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))
+         + "\n\n" + ENGINE_TAIL),
 
     md("""\
-## Notebook event handler
+# TO Number Process
 
-Replaces the .py app's tkinter callback with a plain `print()` so log
-lines appear in cell output. Same `(kind, payload)` protocol the pipeline
-emits.
+| Step | Reads | SAP table | Writes |
+|------|-------|-----------|--------|
+| 1 | Col **K** (TO Number) | `LTAP` | Unloading Point -> **M** |
+| 2 | Col **N + O** (Reservation + Item) | `Z50CFG_ENG_CRNT` | Notification -> **A** (matched rows only), Object / Material / Qty -> **C, D, E**, match key -> **P** |
+| 3 | Col **C** (Object Number) | `Z50CFG_ENG_VALD` | Section / Module / Description / Sales Doc. -> **F, G, H, I** |
+
+Rows without a TO number or reservation pair are skipped -- and their
+column A is left untouched, so the Notification process can fill them next.
 """),
-    code(PRINT_EVENT),
+    code(TO_CELL),
 
     md("""\
----
+# Notification Number Process
 
-## Configure your run
+| Step | Reads | SAP table | Writes |
+|------|-------|-----------|--------|
+| 1 | Col **A** (Notification) | `Z50CFG_ENG_CRNT` | Object / Material / Qty -> **C, D, E** |
+| 2 | Col **C** (Object Number) | `Z50CFG_ENG_VALD` | Section / Module / Description / Sales Doc. / LID -> **F..J** |
 
-Set `WORKFLOW` below (`\"TO\"` or `\"NOTIF\"`), then run the cell. A native
-Windows file-picker dialog pops up so you can browse to the Excel workbook.
-Cancel the dialog to abort.
-
-Set `DIAGNOSE = True` to skip the workbook entirely and just dump the ZTBV
-selection screens (see *How to run* at the top).
-
-> If the dialog does not appear on top, look for it in the taskbar — some
-> Jupyter front-ends push new native windows behind the browser.
+On a combined sheet, run this **after** the TO process -- this is the pass
+that fills the notification-only rows.
 """),
-    code(CONFIG_CELL),
+    code(NOTIF_CELL),
 
     md("""\
-## Execute
+## Troubleshooting
 
-Runs the full workflow against the file you just picked. Log lines appear
-below as each step progresses; the final `===== workflow succeeded =====`
-banner means the workbook has been saved.
+- **A step looks wrong**: press **Cancel** on its message box -- the run
+  stops and the workbook is untouched. Then re-run with `DRY_RUN = True`
+  to inspect match counts without writing.
+- **"Could not resolve the ... filter"**: run the Diagnose cell below and
+  send the log file it names.
+- Every popup's text is also in the log file, so nothing is lost when a
+  box is dismissed. Logs: `%LOCALAPPDATA%\\esa-lookup\\logs\\`.
 """),
-    code(EXECUTE_CELL),
+    code(DIAGNOSE_CELL),
 ]
 
 

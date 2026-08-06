@@ -25,9 +25,10 @@ class TestToWorkflow:
         ok, _ = env.run("TO")
         assert ok
         pastes = env.pastes()
-        # steps 1 and 2 both key on K (TO numbers); step 3 keys on the OBJNR
-        # values step 2 published in memory
-        assert pastes == [["T001", "T002"], ["T001", "T002"], ["OBJ1", "OBJ2"]]
+        # step 1 keys on K (TO numbers), step 2 on the N-column
+        # reservations; step 3 keys on the OBJNR values step 2 published
+        # in memory
+        assert pastes == [["T001", "T002"], ["100", "200"], ["OBJ1", "OBJ2"]]
         # the sentinel garbage in column C must never reach SAP
         assert not any("STALE" in v for p in pastes for v in p)
 
@@ -87,7 +88,7 @@ class TestFailureAtomicity:
             (2, 3): "OBJ1", (3, 3): "OBJ2",             # C   (step 2)
             (2, 4): "MAT1", (2, 5): 5,                  # D,E (step 2)
             (2, 1): "QN1", (3, 1): "QN2",               # A   (step 2 extra)
-            (2, 16): "T001", (3, 16): "T002",           # P   (step 2 audit)
+            (2, 16): "100|1", (3, 16): "200|2",         # P   (step 2 audit)
         })
         # step 3 never ran -> F..I stay empty, J keeps its prior content
         for col in (6, 7, 8, 9):
@@ -159,7 +160,7 @@ class TestSapSelfChecks:
         ok, logs = env.run("TO")
         assert ok, logs
         env.assert_cells(EXPECTED_TO)
-        assert env.pastes() == [["T001"], ["T002"], ["T001"], ["T002"],
+        assert env.pastes() == [["T001"], ["T002"], ["100"], ["200"],
                                 ["OBJ1"], ["OBJ2"]]
         assert "2 chunk(s) of <= 1" in logs
 

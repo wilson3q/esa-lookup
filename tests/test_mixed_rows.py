@@ -1,24 +1,29 @@
-"""Mixed sheets: some rows carry a key, some do not.
+"""Mixed sheets: the either/or model, in miniature.
 
-The ESA rule: rows missing their key are skipped, never fatal, and the rows
-that DO have one must still be processed all the way through. Since the TO
-rework, every TO step keys on column K, so "mixed" means K filled vs K
-blank/'NOT FOUND' -- and the reservation pair N/O is now DERIVED into the
-sheet for matched rows rather than required from the operator.
+The live workbook mixes two kinds of rows: TO rows (K + reservation pair
+N/O filled) and notification-only rows (just a notification in A). The TO
+process must fill the TO rows all the way through, skip the rest without
+failing, and -- critically -- leave column A of the notification-only rows
+untouched, because the NOTIF process keys on it afterwards.
 """
 import pipeline
-from pipeline import ExtraOutput, LookupStep
+from pipeline import LookupStep
 
 
 def _mixed_grid():
-    """4 rows: two with a TO number, one blank, one 'NOT FOUND'."""
+    """4 data rows: two full TO rows, one TO row missing its reservation
+    pair, one notification-only row."""
     g = {}
     for c in range(1, 17):
         g[(1, c)] = f"H{c}"
-    g[(2, 11)] = "T001"
-    g[(3, 11)] = "T002"
-    # row 4: K blank
-    g[(5, 11)] = "NOT FOUND"
+    # rows 2, 3: full TO rows (K + N + O)
+    g[(2, 11)], g[(2, 14)], g[(2, 15)] = "T001", 100, 1
+    g[(3, 11)], g[(3, 14)], g[(3, 15)] = "T002", 200, 2
+    # row 4: TO number but no reservation pair -- step 1 serves it, step 2
+    # must skip it (incomplete composite key)
+    g[(4, 11)] = "T001"
+    # row 5: notification-only row -- A filled, everything else empty
+    g[(5, 1)] = "000429215427"
     return g
 
 
@@ -28,38 +33,37 @@ class TestMixedKeyRows:
         ok, logs = env.run("TO")
         assert ok, logs
 
-    def test_keyed_rows_flow_through_all_three_steps(self, env):
+    def test_full_to_rows_flow_through_all_three_steps(self, env):
         env.grid = _mixed_grid()
         ok, _ = env.run("TO")
         assert ok
         assert env.grid[(2, 13)] == "DockA"    # M: step 1
-        assert env.grid[(2, 3)] == "OBJ1"      # C: step 2
+        assert env.grid[(2, 3)] == "OBJ1"      # C: step 2 (RSNUM|RSPOS)
         assert env.grid[(2, 6)] == "S1"        # F: step 3 keyed off C
         assert env.grid[(3, 13)] == "DockB"
         assert env.grid[(3, 3)] == "OBJ2"
 
-    def test_reservation_pair_is_derived_not_required(self, env):
-        """N/O start empty; step 2 fills them from SAP on match."""
+    def test_notification_only_row_keeps_its_A(self, env):
+        """The pivot of the either/or model: step 2 must NOT touch column A
+        of a row it did not match -- the NOTIF process keys on it later."""
         env.grid = _mixed_grid()
         ok, _ = env.run("TO")
         assert ok
-        assert env.grid[(2, 14)] == 100 and env.grid[(2, 15)] == 1
-        assert env.grid[(3, 14)] == 200 and env.grid[(3, 15)] == 2
-        assert env.grid[(2, 1)] == "QN1"       # A: QMNUM derived on match
+        assert env.grid[(5, 1)] == "000429215427"
+        # ...and its output cells hold no TO-process data
+        assert env.grid.get((5, 3)) in ("", None)
+        assert env.grid.get((5, 13)) in ("", None)
 
-    def test_unkeyed_rows_are_ignored_not_fatal(self, env):
+    def test_partial_reservation_pair_is_skipped_not_fatal(self, env):
         env.grid = _mixed_grid()
-        ok, _ = env.run("TO")
+        ok, logs = env.run("TO")
         assert ok
-        for r in (4, 5):                       # blank and 'NOT FOUND'
-            # "" = cleared, None = preserved-as-empty -- both mean no result
-            assert env.grid.get((r, 3)) in ("", None)   # no OBJNR
-            assert env.grid.get((r, 14)) in ("", None)  # no derived RSNUM
-            assert env.grid.get((r, 6)) in ("", None)   # no Section
+        # row 4: M filled by step 1 (K present)...
+        assert env.grid[(4, 13)] == "DockA"
+        # ...but step 2 skipped it (no reservation pair), so no OBJNR
+        assert env.grid.get((4, 3)) in ("", None)
 
     def test_blanks_never_reach_the_sap_filter(self, env):
-        """The demo behavior: blanks in the pasted list are ignored. We go
-        one better and never send them at all."""
         env.grid = _mixed_grid()
         ok, _ = env.run("TO")
         assert ok
@@ -67,9 +71,8 @@ class TestMixedKeyRows:
             assert all(v not in ("", "NOT FOUND") for v in p), p
 
 
-class TestCompositeKeyStillGuarded:
-    """No shipping step keys on multiple columns since the TO rework, but
-    the half-filled-composite skip logic must survive for any future one."""
+class TestCompositeKeyGuard:
+    """The half-filled-composite skip logic, isolated."""
 
     def _synthetic(self):
         return [LookupStep(

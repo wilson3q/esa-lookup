@@ -116,13 +116,21 @@ Pressing **Stop** is different -- an explicit cancel writes nothing at all.
 
 ## Workflows
 
+The two processes are complementary passes over the SAME sheet (either/or
+model): most rows carry only a Notification Number in column A; a minority
+also carry a TO number (K) + reservation pair (N/O). **Run the TO process
+first, then the Notification process** -- the TO pass fills the TO rows and
+leaves column A of the other rows untouched, and the Notification pass then
+fills those notification-only rows. Running TO *after* NOTIF wipes the
+notification results (each pass clears its output columns before refilling).
+
 ### TO Number process (3 steps)
 
 | # | Read from | SAP table         | SAP filter field   | Writes to Excel columns |
 |---|-----------|-------------------|--------------------|--------------------------|
 | 1 | Col K     | `LTAP`            | TO Number          | `ABLAD` -> M             |
-| 2 | Col N + O | `Z50CFG_ENG_CRNT` | Reservation Number | `QMNUM` -> A, `OBJNR` -> C, `DISP_MATNR` -> D, `DISP_QTY` -> E |
-| 3 | Col C     | `Z50CFG_ENG_VALD` | Object Number      | `Z_SECTION`/`Z_MODULE`/`DESCRIPT`/`SALES_ORDER`/`LID` -> F..J |
+| 2 | Col N + O | `Z50CFG_ENG_CRNT` | Reservation Number | `QMNUM` -> A (matched rows only), `OBJNR` -> C, `DISP_MATNR` -> D, `DISP_QTY` -> E, match key -> P |
+| 3 | Col C     | `Z50CFG_ENG_VALD` | Object Number      | `Z_SECTION`/`Z_MODULE`/`DESCRIPT`/`SALES_ORDER` -> F..I (J cleared on non-match) |
 
 ### Notification Number process (2 steps)
 
