@@ -108,8 +108,11 @@ class TestNotebookCarriesTheCode:
         md = _cell_sources(committed, kind="markdown")
         assert any(s.startswith("# TO Number Process") for s in md)
         assert any(s.startswith("# Notification Number Process") for s in md)
-        # the setup cell must announce itself as skippable machinery
-        assert any(s.startswith("## Setup") for s in md)
+        # the shared-code cell is named in the operator's vocabulary --
+        # "Utility class for data pulling" -- after "Engine", "helper
+        # functions", and "Setup" all drew confused questions
+        assert any(s.startswith("## Utility class for data pulling")
+                   for s in md)
 
     def test_module_qualified_refs_are_rewritten(self, committed):
         """Everything is inlined into one namespace, so `sap_ops.foo(...)`

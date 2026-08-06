@@ -16,7 +16,8 @@ What it does:
   `excel_save` so they can coexist in one module namespace
 - Rewrites `excel_ops.X` / `sap_ops.X` call sites everywhere to bare
   identifiers so the code runs after inlining
-- Assembles ONE collapsible "Setup" cell (imports + all three modules +
+- Assembles ONE collapsible "Utility class for data pulling" cell
+  (imports + all three modules +
   a message-box event handler + `run_process()`), then one runnable cell
   per process: "# TO Number Process" and "# Notification Number Process"
   -- the shape the ESA operator's own notebook used
@@ -281,13 +282,13 @@ def run_process(workflow: str, excel_path: str = "", popups: bool = True,
     return ok
 
 
-print("Setup complete. Now run your process cell below")
+print("Utility class for data pulling: loaded. Now run your process cell below")
 print("(TO Number Process or Notification Number Process).")
 """
 
 TO_CELL = """\
 # =========================================================
-# TO Number Process        (run the Setup cell first)
+# TO Number Process   (run the "Utility class for data pulling" cell first)
 # =========================================================
 POPUPS = True     # message box after each step (OK = continue, Cancel =
                   # stop). ONE-LINE OFF SWITCH: set to False once the first
@@ -300,7 +301,7 @@ run_process("TO", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
 
 NOTIF_CELL = """\
 # =========================================================
-# Notification Number Process   (run the Setup cell first)
+# Notification Number Process   (run the "Utility class" cell first)
 # =========================================================
 POPUPS = True     # message box after each step -- same one-line switch
 DRY_RUN = False   # True = report match counts only, write nothing
@@ -367,8 +368,8 @@ exactly as they were).
 ## How to use -- 3 actions
 
 1. Log into SAP GUI and open the workbook in Excel (or know its path).
-2. Run the **Setup** cell first. Nothing to read or change in it, and
-   running it again is always harmless.
+2. Run the **Utility class for data pulling** cell first. Nothing to
+   read or change in it, and running it again is always harmless.
 3. Run YOUR process cell: **TO Number Process** or **Notification Number
    Process**. A message box reports each step: **OK** = continue,
    **Cancel** = stop with the workbook untouched.
@@ -377,7 +378,8 @@ On a combined sheet run the **TO process FIRST**, then the Notification
 process -- the second pass fills the notification-only rows (usually most
 of the sheet).
 
-**Cell -> Run All works too**, and runs exactly that order: Setup, TO
+**Cell -> Run All works too**, and runs exactly that order: the utility
+class, TO
 process, Notification process. You browse to the workbook once; the second
 process re-uses it automatically. If a process fails or you press Cancel,
 the cells after it are stopped. The Diagnose cell at the bottom never runs
@@ -388,14 +390,14 @@ Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 """),
 
     md("""\
-## Setup -- always run this cell first
+## Utility class for data pulling -- always run this cell first
 
-The code both processes share (Excel read/write, SAP scripting, the step
-runner). **Nothing in here needs reading or editing.** Just run it, then go
-to your process below. Running it again at any time is harmless. It is
-auto-generated from the app's source files by `build_notebook.py`; to
-change behavior, change those files and regenerate. Do not hand-edit this
-notebook.
+The data-pulling utilities both processes use: Excel read/write, SAP GUI
+scripting, and the step runner. **Nothing in here needs reading or
+editing.** Just run it, then go to your process below. Running it again at
+any time is harmless. It is auto-generated from the app's source files by
+`build_notebook.py`; to change behavior, change those files and regenerate.
+Do not hand-edit this notebook.
 """),
     code(IMPORTS
          + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
