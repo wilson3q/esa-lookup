@@ -16,12 +16,10 @@ What it does:
   `excel_save` so they can coexist in one module namespace
 - Rewrites `excel_ops.X` / `sap_ops.X` call sites everywhere to bare
   identifiers so the code runs after inlining
-- Embeds the full program (imports + all three modules + a message-box
-  event handler + `run_process()`) INSIDE each runnable cell, below the
-  3 settings lines -- so every cell is complete by itself and there is no
-  separate setup cell to run or explain. Duplication is free: the file is
-  generated. Cells: "# TO Number Process", "# Notification Number
-  Process", and an inert troubleshooting cell
+- Assembles ONE collapsible "Setup" cell (imports + all three modules +
+  a message-box event handler + `run_process()`), then one runnable cell
+  per process: "# TO Number Process" and "# Notification Number Process"
+  -- the shape the ESA operator's own notebook used
 
 If any of the source .py files gain a NEW function or dataclass, it
 automatically shows up in the regenerated notebook -- no builder edit
@@ -126,9 +124,8 @@ def rewrite_pipeline_refs(src: str) -> str:
 # ---------------------------------------------------------------------------
 
 IMPORTS = """\
-# NOTE: no `from __future__ import annotations` here -- the settings lines
-# sit above this code inside each cell, and __future__ must come first.
-# Python 3.10+ evaluates the annotations below natively.
+from __future__ import annotations
+
 import contextlib
 import difflib
 import io
@@ -211,10 +208,8 @@ def make_event_handler(popups: bool):
 
 
 # Remembered across cells, so Run All asks for the workbook ONCE and the
-# Notification cell re-uses the file the TO cell picked. globals().get:
-# every process cell re-runs this program code, and that must not forget
-# the file picked by an earlier cell.
-_last_browsed = globals().get("_last_browsed", "")
+# Notification cell re-uses the file the TO cell picked.
+_last_browsed = ""
 
 
 def run_process(workflow: str, excel_path: str = "", popups: bool = True,
@@ -285,72 +280,49 @@ def run_process(workflow: str, excel_path: str = "", popups: bool = True,
             "this cell.")
     return ok
 
+
+print("Setup complete. Now run your process cell below")
+print("(TO Number Process or Notification Number Process).")
 """
 
-TO_HEADER = """\
+TO_CELL = """\
 # =========================================================
-# TO Number Process -- check the 3 settings, then run me
+# TO Number Process        (run the Setup cell first)
 # =========================================================
 POPUPS = True     # message box after each step (OK = continue, Cancel =
-                  # stop, nothing written). ONE-LINE OFF SWITCH: set False
-                  # once the first days go smoothly. Errors always popup.
+                  # stop). ONE-LINE OFF SWITCH: set to False once the first
+                  # days have gone smoothly. Error boxes always show.
 DRY_RUN = False   # True = report match counts only, write nothing
-EXCEL_PATH = r""  # workbook path; leave "" to browse. The file you pick is
-                  # re-used by the other cells until you restart Jupyter.
-
-# ---------------------------------------------------------------------------
-# Everything below is the program (auto-generated). DO NOT EDIT -- the only
-# lines meant for you are the three settings above and the last line.
-# ---------------------------------------------------------------------------
-"""
-
-TO_CALL = """\
-
+EXCEL_PATH = r""  # paste the workbook's full path here, or leave "" to browse
 
 run_process("TO", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
 """
 
-NOTIF_HEADER = """\
+NOTIF_CELL = """\
 # =========================================================
-# Notification Number Process -- check the 3 settings, run me
+# Notification Number Process   (run the Setup cell first)
 # =========================================================
 POPUPS = True     # message box after each step -- same one-line switch
 DRY_RUN = False   # True = report match counts only, write nothing
-EXCEL_PATH = r""  # workbook path; leave "" to browse (or re-use the file
-                  # picked by the TO cell)
-
-# ---------------------------------------------------------------------------
-# Everything below is the program (auto-generated). DO NOT EDIT -- the only
-# lines meant for you are the three settings above and the last line.
-# ---------------------------------------------------------------------------
-"""
-
-NOTIF_CALL = """\
-
+EXCEL_PATH = r""  # paste the workbook's full path here, or leave "" to browse
 
 run_process("NOTIF", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
 """
 
-DIAGNOSE_HEADER = """\
-# =========================================================
-# Troubleshooting only -- normally you NEVER run this cell
-# =========================================================
-# When a run stops with "Could not resolve the ... filter":
-#   1. Uncomment the LAST LINE of this cell.
-#   2. Run the cell. It reads the ZTBV screens (no Excel, no query,
-#      nothing written) and prints which S<n> filter slot is which.
-#   3. Send the log file it names.
-
-# ---------------------------------------------------------------------------
-# Everything below is the program (auto-generated). DO NOT EDIT.
-# ---------------------------------------------------------------------------
-"""
-
-DIAGNOSE_CALL = """\
-
-
-print("Diagnose: nothing ran -- uncomment the last line of this cell first.")
+DIAGNOSE_CELL = """\
+# Only needed when a run stops with "Could not resolve the ... filter".
+# Reads the ZTBV selection screens for the chosen process and prints which
+# S<n> filter slot is which. No Excel file, no query, nothing written.
+# Send the log file it names.
+#
+# Deliberately COMMENTED OUT so a Run All never triggers it -- uncomment
+# the next line only when you need it, then run this cell:
 # run_process("TO", diagnose=True)          # or "NOTIF"
+
+# If Diagnose names the right slot, pin it here and re-run your process --
+# example (uncomment and adjust):
+# PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "RSNUM")] = push_button_id("S15")
+print("Diagnose cell: nothing to do (see the comments in this cell).")
 """
 
 # ---------------------------------------------------------------------------
@@ -379,14 +351,6 @@ def code(source: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-ENGINE_SRC = (
-    IMPORTS
-    + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
-    + "\n\n" + rename_sap_ops(strip_header(read_py("sap_ops.py")))
-    + "\n\n" + rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))
-    + "\n\n" + ENGINE_TAIL
-)
-
 CELLS = [
     md("""\
 # esa-lookup -- TO Number & Notification Number processes
@@ -400,21 +364,44 @@ workbook is written **once, at the end** (never left half-filled: if a step
 fails, the completed steps are written and the rest of the columns are left
 exactly as they were).
 
-## How to use
+## How to use -- 3 actions
 
 1. Log into SAP GUI and open the workbook in Excel (or know its path).
-2. Run the **TO Number Process** cell. A message box reports each step:
-   **OK** = continue, **Cancel** = stop with the workbook untouched.
-3. Then run the **Notification Number Process** cell -- it fills the rows
-   that have no TO number (usually most of the sheet).
+2. Run the **Setup** cell first. Nothing to read or change in it, and
+   running it again is always harmless.
+3. Run YOUR process cell: **TO Number Process** or **Notification Number
+   Process**. A message box reports each step: **OK** = continue,
+   **Cancel** = stop with the workbook untouched.
 
-Each cell is complete by itself -- just run it. **Cell -> Run All** also
-works: it runs the same cells in the same (correct) order, you pick the
-workbook once, and if a process fails the cells after it are stopped.
+On a combined sheet run the **TO process FIRST**, then the Notification
+process -- the second pass fills the notification-only rows (usually most
+of the sheet).
 
-Every run writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
+**Cell -> Run All works too**, and runs exactly that order: Setup, TO
+process, Notification process. You browse to the workbook once; the second
+process re-uses it automatically. If a process fails or you press Cancel,
+the cells after it are stopped. The Diagnose cell at the bottom never runs
+unless you uncomment it.
+
+Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 (last 20 kept). Attach it whenever reporting a problem.
 """),
+
+    md("""\
+## Setup -- always run this cell first
+
+The code both processes share (Excel read/write, SAP scripting, the step
+runner). **Nothing in here needs reading or editing.** Just run it, then go
+to your process below. Running it again at any time is harmless. It is
+auto-generated from the app's source files by `build_notebook.py`; to
+change behavior, change those files and regenerate. Do not hand-edit this
+notebook.
+"""),
+    code(IMPORTS
+         + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
+         + "\n\n" + rename_sap_ops(strip_header(read_py("sap_ops.py")))
+         + "\n\n" + rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))
+         + "\n\n" + ENGINE_TAIL),
 
     md("""\
 # TO Number Process
@@ -427,11 +414,8 @@ Every run writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 
 Rows without a TO number or reservation pair are skipped -- and their
 column A is left untouched, so the Notification process can fill them next.
-
-*Change the 3 settings at the top of the cell if needed, then run it.
-Everything below the settings is the program -- no need to scroll or read.*
 """),
-    code(TO_HEADER + ENGINE_SRC + TO_CALL),
+    code(TO_CELL),
 
     md("""\
 # Notification Number Process
@@ -444,7 +428,7 @@ Everything below the settings is the program -- no need to scroll or read.*
 On a combined sheet, run this **after** the TO process -- this is the pass
 that fills the notification-only rows.
 """),
-    code(NOTIF_HEADER + ENGINE_SRC + NOTIF_CALL),
+    code(NOTIF_CELL),
 
     md("""\
 ## Troubleshooting
@@ -452,12 +436,12 @@ that fills the notification-only rows.
 - **A step looks wrong**: press **Cancel** on its message box -- the run
   stops and the workbook is untouched. Then re-run with `DRY_RUN = True`
   to inspect match counts without writing.
-- **"Could not resolve the ... filter"**: use the cell below (read its
-  comments) and send the log file it names.
+- **"Could not resolve the ... filter"**: run the Diagnose cell below and
+  send the log file it names.
 - Every popup's text is also in the log file, so nothing is lost when a
   box is dismissed. Logs: `%LOCALAPPDATA%\\esa-lookup\\logs\\`.
 """),
-    code(DIAGNOSE_HEADER + ENGINE_SRC + DIAGNOSE_CALL),
+    code(DIAGNOSE_CELL),
 ]
 
 
