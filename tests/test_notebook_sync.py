@@ -91,12 +91,12 @@ class TestNotebookCarriesTheCode:
         Diagnose. Verified live in the session that added this; pinned
         here so it cannot regress."""
         code = _cell_sources(committed)
-        engine = next(s for s in code if "def run_process(" in s)
+        setup = next(s for s in code if "def run_process(" in s)
         # failure/cancel raises so Jupyter cancels the queued cells
-        assert "raise SystemExit" in engine
-        assert "did not complete" in engine
+        assert "raise SystemExit" in setup
+        assert "did not complete" in setup
         # one Browse for the whole Run All: the picked path is remembered
-        assert "_last_browsed" in engine
+        assert "_last_browsed" in setup
         # the Diagnose call must be commented out, not live
         diag = code[-1]
         for line in diag.splitlines():
@@ -108,8 +108,8 @@ class TestNotebookCarriesTheCode:
         md = _cell_sources(committed, kind="markdown")
         assert any(s.startswith("# TO Number Process") for s in md)
         assert any(s.startswith("# Notification Number Process") for s in md)
-        # the engine must announce itself as skippable machinery
-        assert any("run once" in s.lower() for s in md)
+        # the setup cell must announce itself as skippable machinery
+        assert any(s.startswith("## Setup") for s in md)
 
     def test_module_qualified_refs_are_rewritten(self, committed):
         """Everything is inlined into one namespace, so `sap_ops.foo(...)`
