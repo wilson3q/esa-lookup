@@ -85,6 +85,25 @@ class TestNotebookCarriesTheCode:
         assert any("diagnose=True" in s for s in code), \
             "the troubleshooting cell must expose Diagnose"
 
+    def test_run_all_is_safe(self, committed):
+        """Cell -> Run All must execute the combined flow (TO then NOTIF),
+        pick the workbook once, halt on failure, and never auto-run
+        Diagnose. Verified live in the session that added this; pinned
+        here so it cannot regress."""
+        code = _cell_sources(committed)
+        engine = next(s for s in code if "def run_process(" in s)
+        # failure/cancel raises so Jupyter cancels the queued cells
+        assert "raise SystemExit" in engine
+        assert "did not complete" in engine
+        # one Browse for the whole Run All: the picked path is remembered
+        assert "_last_browsed" in engine
+        # the Diagnose call must be commented out, not live
+        diag = code[-1]
+        for line in diag.splitlines():
+            if "diagnose=True" in line:
+                assert line.lstrip().startswith("#"), \
+                    "Diagnose must never run during a Run All"
+
     def test_process_boundaries_are_markdown_headings(self, committed):
         md = _cell_sources(committed, kind="markdown")
         assert any(s.startswith("# TO Number Process") for s in md)

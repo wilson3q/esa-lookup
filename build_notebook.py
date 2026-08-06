@@ -207,39 +207,60 @@ def make_event_handler(popups: bool):
     return on_event
 
 
+# Remembered across cells, so Run All asks for the workbook ONCE and the
+# Notification cell re-uses the file the TO cell picked.
+_last_browsed = ""
+
+
 def run_process(workflow: str, excel_path: str = "", popups: bool = True,
                 dry_run: bool = False, diagnose: bool = False) -> bool:
     \"\"\"Run one process end to end.
 
     workflow    "TO" or "NOTIF"
-    excel_path  full path to the workbook; "" opens a Browse dialog
+    excel_path  full path to the workbook; "" opens a Browse dialog the
+                first time and re-uses that file for later cells in the
+                same kernel session (restart the kernel, or set EXCEL_PATH,
+                to pick a different file)
     popups      message box after each step (OK = continue, Cancel = stop).
                 One-line off switch in the process cell. Error boxes always
                 show regardless.
     dry_run     look everything up, report counts, write nothing
     diagnose    dump the ZTBV selection screens instead of processing
                 (no Excel file needed)
+
+    On failure or Cancel this raises SystemExit, so a Run All stops HERE
+    instead of blindly executing the next process cell.
     \"\"\"
+    global _last_browsed
     if workflow not in WORKFLOWS:
         raise SystemExit(
             f"workflow must be one of {list(WORKFLOWS)}, got {workflow!r}")
     if not diagnose and not excel_path:
-        import tkinter as tk
-        from tkinter import filedialog
-        _root = tk.Tk()
-        _root.withdraw()
-        _root.attributes("-topmost", True)
-        try:
-            excel_path = filedialog.askopenfilename(
-                title="Select the Excel workbook to process",
-                filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
-                           ("All files", "*.*")],
-            )
-        finally:
-            _root.destroy()
-        if not excel_path:
-            print("No file selected -- nothing was run.")
-            return False
+        if _last_browsed:
+            excel_path = _last_browsed
+            print(f"Re-using the workbook selected earlier this session:")
+            print(f"  {excel_path}")
+            print("(set EXCEL_PATH in the cell, or restart the kernel, to "
+                  "pick a different file)")
+        else:
+            import tkinter as tk
+            from tkinter import filedialog
+            _root = tk.Tk()
+            _root.withdraw()
+            _root.attributes("-topmost", True)
+            try:
+                excel_path = filedialog.askopenfilename(
+                    title="Select the Excel workbook to process",
+                    filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xlsb"),
+                               ("All files", "*.*")],
+                )
+            finally:
+                _root.destroy()
+            if not excel_path:
+                raise SystemExit(
+                    "No file selected -- nothing was run, and the cells "
+                    "after this one were stopped.")
+            _last_browsed = excel_path
     cfg = RunConfig(
         excel_path=excel_path,
         workflow=workflow,
@@ -248,7 +269,16 @@ def run_process(workflow: str, excel_path: str = "", popups: bool = True,
         diagnose=diagnose,
         step_popups=popups,
     )
-    return run(cfg, on_event=make_event_handler(popups))
+    ok = run(cfg, on_event=make_event_handler(popups))
+    if not ok:
+        # Stop a Run All at the point of failure. The log above (and the
+        # log file) say what happened; the next process must not run on top
+        # of a failed or cancelled one.
+        raise SystemExit(
+            "This process did not complete (failed or cancelled) -- the "
+            "cells after this one were stopped. Fix the issue and re-run "
+            "this cell.")
+    return ok
 
 
 print("Engine loaded. Now run your process cell below")
@@ -284,11 +314,15 @@ DIAGNOSE_CELL = """\
 # Reads the ZTBV selection screens for the chosen process and prints which
 # S<n> filter slot is which. No Excel file, no query, nothing written.
 # Send the log file it names.
-run_process("TO", diagnose=True)          # or "NOTIF"
+#
+# Deliberately COMMENTED OUT so a Run All never triggers it -- uncomment
+# the next line only when you need it, then run this cell:
+# run_process("TO", diagnose=True)          # or "NOTIF"
 
 # If Diagnose names the right slot, pin it here and re-run your process --
 # example (uncomment and adjust):
 # PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "RSNUM")] = push_button_id("S15")
+print("Diagnose cell: nothing to do (see the comments in this cell).")
 """
 
 # ---------------------------------------------------------------------------
@@ -342,6 +376,12 @@ exactly as they were).
 On a combined sheet run the **TO process FIRST**, then the Notification
 process -- the second pass fills the notification-only rows (usually most
 of the sheet).
+
+**Cell -> Run All works too**, and runs exactly that order: Engine, TO
+process, Notification process. You browse to the workbook once; the second
+process re-uses it automatically. If a process fails or you press Cancel,
+the cells after it are stopped. The Diagnose cell at the bottom never runs
+unless you uncomment it.
 
 Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 (last 20 kept). Attach it whenever reporting a problem.
