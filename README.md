@@ -73,6 +73,30 @@ the chosen process and logs what it finds -- no Excel file needed, no query
 run, nothing written. Use it when a run stops with *"Could not resolve the
 ... filter"*; see [Troubleshooting](#troubleshooting).
 
+## Popups (original notebook behavior)
+
+The original notebook talked to its operator through blocking message
+boxes, and that is how the ESA operator troubleshoots: screenshot the popup
+together with the SAP screen and send both. The app reproduces that:
+
+- **After each step** (checkbox *"Popup after each step"*, on by default): a
+  modal box with the notebook's counts -- SAP rows detected, matched, not
+  matched, skipped -- plus which columns were read and where results will be
+  written. **OK** continues; the SAP result grid is still on screen behind
+  the box, so it can be inspected first. **Cancel** stops the run with the
+  workbook untouched.
+- **On any failure** (always, regardless of the checkbox): an error box with
+  the failing step, SAP's own error text, a snapshot of the SAP screen at
+  that moment (window title, open popups, status bar), the exact workbook
+  state (untouched / completed-steps-only / partial), and the log file path.
+  The SAP window is left exactly where it stopped -- **screenshot both the
+  SAP window and the popup** when reporting.
+- **On completion / dry run / cancel**: a summary box with per-step counts
+  and whether the workbook was saved.
+
+Every popup is also written to the run's log file, so its content survives
+after the box is dismissed.
+
 ## What happens when a step fails
 
 Each step writes its own block of columns, and steps run in order. If a step

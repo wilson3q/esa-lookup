@@ -438,6 +438,31 @@ def read_statusbar(s: SapSession) -> tuple[str, str]:
         return "", ""
 
 
+def screen_snapshot(s: SapSession) -> str:
+    """One plain-text snapshot of where SAP currently stands: main window
+    title, any open popup titles, and the status bar message.
+
+    Used by the error popup. The operator standing at the machine sees the
+    frozen SAP screen; the person debugging remotely sees only what we
+    capture here -- so grab everything cheap and never raise.
+    """
+    parts = []
+    try:
+        parts.append(f"window:  {str(s.find('wnd[0]').Text or '').strip()}")
+    except Exception:
+        parts.append("window:  (unreadable -- SAP GUI may be gone)")
+    for i in (1, 2):
+        try:
+            title = str(s.find(f"wnd[{i}]").Text or "").strip()
+            parts.append(f"popup wnd[{i}]: {title or '(untitled)'}")
+        except Exception:
+            pass  # no popup at this level -- the common case
+    msg_type, msg_text = read_statusbar(s)
+    if msg_text:
+        parts.append(f"status bar: [{msg_type or ' '}] {msg_text}")
+    return "\n".join(parts)
+
+
 def query_result_check(s: SapSession, log=None) -> int:
     """Item 2: after F8, confirm a result grid exists and return its row
     count (0 = query ran but matched nothing).

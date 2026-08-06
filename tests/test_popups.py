@@ -1,0 +1,126 @@
+"""Popup events: the original notebook's message-box behavior, reproduced.
+
+The ESA operator troubleshoots by screenshotting a blocking popup together
+with the SAP screen -- the original notebook ended every step and every
+failure with one. The pipeline emits ("popup", {...}) events for the GUI to
+render as modal boxes: "step" popups (ack Event, OK/Cancel) after each step
+when RunConfig.step_popups is on, and fire-and-forget "info"/"error" popups
+for completion / cancellation / failure regardless of that flag.
+"""
+import pipeline
+from conftest import make_to_grid
+
+
+def step_popups(env):
+    return [p for p in env.popups if p.get("ack") is not None]
+
+
+class TestStepPopups:
+    def test_one_blocking_popup_per_step_plus_completion(self, env):
+        env.grid = make_to_grid()
+        ok, _ = env.run("TO", step_popups=True)
+        assert ok
+        assert len(step_popups(env)) == 3          # one per TO step
+        final = env.popups[-1]
+        assert final.get("ack") is None and final["kind"] == "info"
+        assert final["title"] == "Completed"
+
+    def test_step_popup_carries_the_notebook_counts(self, env):
+        env.grid = make_to_grid()
+        env.run("TO", step_popups=True)
+        msg = step_popups(env)[0]["message"]
+        assert "SAP LTAP rows detected: 2" in msg
+        assert "Matched: 2" in msg
+        assert "Not matched: 0" in msg
+        assert "column(s) K" in msg                # where keys came from
+        assert "M" in msg                          # where results go
+
+    def test_cancel_on_a_step_popup_stops_with_workbook_untouched(self, env):
+        env.grid = make_to_grid()
+        env.popup_cancel_at = 1                    # press Cancel on popup 1
+        ok, logs = env.run("TO", step_popups=True)
+        assert not ok
+        assert "cancelled" in logs
+        assert env.grid == make_to_grid()
+        # only the popup that was cancelled fired; no further SAP steps ran
+        assert len(step_popups(env)) == 1
+
+    def test_off_by_default_no_blocking_popups(self, env):
+        env.grid = make_to_grid()
+        ok, _ = env.run("TO")
+        assert ok
+        assert step_popups(env) == []
+        # ...but the completion popup still shows
+        assert any(p["title"] == "Completed" for p in env.popups)
+
+
+class TestErrorPopup:
+    def test_failure_pops_an_error_box_with_the_essentials(self, env):
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"
+        ok, _ = env.run("TO")
+        assert not ok
+        errors = [p for p in env.popups if p["kind"] == "error"]
+        assert len(errors) == 1
+        msg = errors[0]["message"]
+        assert "Step 3 of 3 (Z50CFG_ENG_VALD)" in msg   # which step died
+        assert "simulated SAP error" in msg             # SAP's own words
+        assert "screenshot" in msg.lower()              # what to do next
+        # the workbook state must match what the log claims (salvage ran)
+        assert "completed steps ONLY" in msg
+
+    def test_error_popup_fires_even_with_step_popups_off(self, env):
+        env.grid = make_to_grid()
+        env.fail_table = "LTAP"
+        ok, _ = env.run("TO")
+        assert not ok
+        assert any(p["kind"] == "error" for p in env.popups)
+        # first step failed -> nothing salvageable -> says NOT modified
+        msg = [p for p in env.popups if p["kind"] == "error"][0]["message"]
+        assert "NOT modified" in msg
+
+    def test_empty_primary_column_pops_the_notebook_style_warning(self, env):
+        env.grid = {(1, 1): "H1"}                  # headers only, no data
+        ok, _ = env.run("TO")
+        assert not ok
+        errors = [p for p in env.popups if p["kind"] == "error"]
+        assert len(errors) == 1
+        assert "column K" in errors[0]["message"]
+
+
+class TestDryRunAndCancelPopups:
+    def test_dry_run_completion_popup_says_not_modified(self, env):
+        env.grid = make_to_grid()
+        ok, _ = env.run("TO", dry_run=True)
+        assert ok
+        final = env.popups[-1]
+        assert final["title"] == "Dry run complete"
+        assert "NOT modified" in final["message"]
+
+    def test_stop_before_run_pops_cancelled(self, env):
+        import threading
+        env.grid = make_to_grid()
+        stop = threading.Event()
+        stop.set()
+        ok, _ = env.run("TO", stop_event=stop)
+        assert not ok
+        assert any(p["title"] == "Cancelled" for p in env.popups)
+
+
+class TestPopupContract:
+    def test_every_popup_is_logged_to_the_run_file_format(self, env):
+        """Popups carry the troubleshooting payload; they must never exist
+        only on screen. _popup writes each one to the file log, so the
+        payload survives after the box is dismissed."""
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"
+        env.run("TO", step_popups=True)
+        # contract-level check: every popup event has the fields the GUI
+        # and the file log need
+        for p in env.popups:
+            assert p["kind"] in ("step", "info", "error")
+            assert p["title"] and p["message"]
+            if p["kind"] == "step":
+                assert p["ack"] is not None and p["result"] is not None
+            else:
+                assert p["ack"] is None

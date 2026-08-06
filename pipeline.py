@@ -272,6 +272,15 @@ WORKFLOWS = {
 #   ("log", (message: str, level: "info"|"ok"|"warn"|"error"))
 #   ("status", message: str)
 #   ("progress", fraction: float 0..1)
+#   ("popup", {"kind": "step"|"info"|"error", "title": str, "message": str,
+#              "ack": threading.Event|None, "result": {"proceed": bool}|None})
+#     The original notebook spoke to its operator through blocking message
+#     boxes -- a counts popup after every step, an error popup on failure --
+#     and the ESA operator troubleshoots by screenshotting those together
+#     with the SAP screen. These events reproduce that behavior. "step"
+#     popups carry an ack Event: the handler MUST show OK/Cancel, write the
+#     choice into result["proceed"], and set ack. "info"/"error" popups are
+#     fire-and-forget.
 #   ("done", ok: bool)
 
 EventFn = Callable[[str, object], None]
@@ -369,6 +378,36 @@ def _status(on_event: EventFn, msg: str) -> None:
 def _progress(on_event: EventFn, frac: float) -> None:
     # Progress ticks are too noisy for the file log.
     on_event("progress", max(0.0, min(1.0, frac)))
+
+
+def _popup(on_event: EventFn, kind: str, title: str, message: str,
+           ack=None, result=None) -> None:
+    _file_log("POPUP", f"[{kind}] {title}: " + message.replace("\n", " | "))
+    on_event("popup", {"kind": kind, "title": title, "message": message,
+                       "ack": ack, "result": result})
+
+
+def _step_popup(on_event: EventFn, stop: threading.Event,
+                title: str, message: str) -> None:
+    """Blocking per-step popup, the original notebook's rhythm: show the
+    counts, wait for the operator's OK before touching SAP again -- so they
+    can inspect the result grid still on screen -- or Cancel to stop the
+    run (the workbook is untouched during the fetch phase).
+
+    The wait polls so a Stop pressed through other means still interrupts.
+    If the event handler never acks (headless caller that ignores popups),
+    the run would wait forever -- which is why step popups are opt-in via
+    RunConfig.step_popups and every shipped handler acks.
+    """
+    ack = threading.Event()
+    result = {"proceed": True}
+    _popup(on_event, "step", title, message, ack=ack, result=result)
+    while not ack.wait(0.1):
+        if stop.is_set():
+            raise Cancelled()
+    if not result["proceed"]:
+        stop.set()
+        raise Cancelled()
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +804,7 @@ class StepResult:
     n_skipped: int
     matched: int
     unmatched: int
+    sap_rows: int = 0     # total rows SAP's grid reported across all chunks
 
 
 def _fetch_step(
@@ -777,6 +817,7 @@ def _fetch_step(
     step_index: int,
     total_steps: int,
     stop: threading.Event,
+    step_popups: bool = False,
 ) -> StepResult | None:
     """Run the SAP side of one lookup step and match it against the step's
     key column -- WITHOUT touching the workbook. Returns None when the step
@@ -816,6 +857,14 @@ def _fetch_step(
              f"No data below the header in column {_col_letter(primary_col)} "
              f"(#{primary_col}); step skipped", "warn")
         _progress(on_event, (step_index + 1) / n_segments)
+        if step_popups:
+            _step_popup(
+                on_event, stop,
+                f"Step {step_index + 1} of {total_steps} skipped",
+                f"{step.name}\n\n"
+                f"No data below the header in column "
+                f"{_col_letter(primary_col)} -- nothing to look up.\n\n"
+                f"OK = continue with the next step, Cancel = stop the run.")
         return None
 
     key_vals = {c: vsheet.get_col(c, last_row) for c in step.key_columns}
@@ -894,6 +943,16 @@ def _fetch_step(
              f"(after skipping blanks / 'NOT FOUND'); step is a no-op",
              "warn")
         _progress(on_event, (step_index + 1) / n_segments)
+        if step_popups:
+            _step_popup(
+                on_event, stop,
+                f"Step {step_index + 1} of {total_steps} skipped",
+                f"{step.name}\n\n"
+                f"Column(s) "
+                f"{'/'.join(_col_letter(c) for c in step.key_columns)} hold "
+                f"no usable keys (all blank or 'NOT FOUND') -- nothing was "
+                f"sent to SAP.\n\n"
+                f"OK = continue with the next step, Cancel = stop the run.")
         return None
 
     _log(on_event, f"{len(unique_paste_values)} unique key(s) will be sent to SAP")
@@ -930,6 +989,7 @@ def _fetch_step(
     # is unavailable here it will be unavailable for every other chunk too,
     # and flip-flopping between paths mid-step would mix column namings.
     use_grid = True
+    sap_rows_total = 0
     for ci, chunk in enumerate(chunks):
         if stop.is_set():
             raise Cancelled()
@@ -968,6 +1028,7 @@ def _fetch_step(
         # error message or missing grid fails HERE with SAP's own words
         # instead of a confusing export failure two calls later.
         grid_rows = sap_ops.query_result_check(sap, log=lambda m: _log(on_event, m))
+        sap_rows_total += grid_rows
         if grid_rows == 0:
             _log(on_event, f"SAP returned 0 rows{tag}; nothing to export", "warn")
             sub_progress(2 + 4 * (ci + 1) / len(chunks))
@@ -1119,7 +1180,7 @@ def _fetch_step(
          + " (write deferred to final pass)",
          "ok")
     _progress(on_event, (step_index + 1) / n_segments)
-    return StepResult(
+    result = StepResult(
         step=step,
         step_index=step_index,
         last_row=last_row,
@@ -1128,7 +1189,27 @@ def _fetch_step(
         n_skipped=n_skipped,
         matched=matched,
         unmatched=unmatched,
+        sap_rows=sap_rows_total,
     )
+    if step_popups:
+        # The original notebook's per-step message box, counts and all. The
+        # operator can look at the SAP result grid (still on screen) before
+        # clicking OK; Cancel stops the run with the workbook untouched.
+        key_cols = "/".join(_col_letter(c) for c in sorted(step.key_columns))
+        out_cols = ", ".join(_step_columns(step))
+        _step_popup(
+            on_event, stop,
+            f"Step {step_index + 1} of {total_steps} completed",
+            f"{step.name}\n\n"
+            f"SAP {step.sap_table} rows detected: {sap_rows_total}\n"
+            f"Matched: {matched}\n"
+            f"Not matched: {unmatched}\n"
+            f"Skipped (blank / NOT FOUND): {n_skipped}\n\n"
+            f"Keys were read from column(s) {key_cols}.\n"
+            f"Results go to column(s) {out_cols}, written together at the "
+            f"end of the run.\n\n"
+            f"OK = continue, Cancel = stop the run (workbook untouched).")
+    return result
 
 
 def _write_back(
@@ -1331,24 +1412,46 @@ def _salvage_completed_steps(
         return "partial"
 
 
+def _write_state_text(write_state: str) -> str:
+    """One plain sentence about the workbook, shared by the log lines and
+    the popups so the two can never disagree."""
+    return {
+        "none": "The workbook was NOT modified.",
+        "salvaged": ("The workbook holds the completed steps ONLY (see "
+                     "WRITTEN / NOT RUN in the log) and has been saved. "
+                     "Re-running after the fix is safe -- every step "
+                     "rewrites its own columns from scratch."),
+        "partial": ("Failure happened DURING the final write-back -- the "
+                    "workbook may be partially updated and has NOT been "
+                    "saved. Review it before saving manually."),
+        "done": ("All output columns were written in one pass and the "
+                 "workbook was SAVED."),
+    }[write_state]
+
+
+def _run_summary_lines(results: list[StepResult]) -> str:
+    """Per-step counts for the completion popup, one line per step ran."""
+    if not results:
+        return "No step had anything to look up."
+    return "\n".join(
+        f"Step {r.step_index + 1} ({r.step.sap_table}): "
+        f"{r.matched} matched / {r.unmatched} not matched"
+        + (f" / {r.n_skipped} skipped" if r.n_skipped else "")
+        + f" -> columns {', '.join(_step_columns(r.step))}"
+        for r in results)
+
+
 def _log_write_state(on_event: EventFn, write_state: str) -> None:
     """After a cancel/failure, tell the user exactly what state the file is
     in."""
     if write_state == "none":
         _log(on_event,
-             "the workbook was NOT modified (no step completed before the "
+             _write_state_text("none") + " (no step completed before the "
              "failure)", "info")
     elif write_state == "salvaged":
-        _log(on_event,
-             "the workbook holds the completed steps ONLY (see WRITTEN / "
-             "NOT RUN above) and has been saved. Fix the failure and re-run "
-             "to fill the rest -- re-running is safe, every step rewrites "
-             "its own columns from scratch.", "warn")
+        _log(on_event, _write_state_text("salvaged"), "warn")
     elif write_state == "partial":
-        _log(on_event,
-             "WARNING: failure happened DURING the final write-back -- the "
-             "workbook may be partially updated and has not been saved. "
-             "Review it before saving manually.", "warn")
+        _log(on_event, "WARNING: " + _write_state_text("partial"), "warn")
 
 
 def _dry_run_report(results: list[StepResult], on_event: EventFn) -> None:
@@ -1459,6 +1562,10 @@ class RunConfig:
     stop_event: threading.Event
     dry_run: bool = False    # Item 4: fetch + report matches, write nothing
     diagnose: bool = False   # dump SAP selection screens; touch nothing else
+    # Original-notebook rhythm: a blocking counts popup after every step
+    # (OK = continue, Cancel = stop). Error and completion popups are always
+    # emitted regardless of this flag; this only controls the per-step ones.
+    step_popups: bool = False
 
 
 def run(cfg: RunConfig, on_event: EventFn) -> bool:
@@ -1476,10 +1583,35 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     # phase), "partial" -> failure mid write-back, "done" -> fully written.
     write_state = "none"
     # Declared up here so the failure handlers can salvage whatever the fetch
-    # phase managed to complete before it died.
+    # phase managed to complete before it died, and so the error popup can
+    # name the step and snapshot the SAP screen.
     xl = None
+    sap = None
     steps: list[LookupStep] = []
     results: list[StepResult] = []
+    step_label = "startup (before any SAP step)"
+
+    def _error_popup(err_text: str) -> None:
+        """The original notebook's 'Error occurred' message box, upgraded
+        with what a remote debugger needs: the step, the SAP screen at the
+        moment of failure, the workbook state, and the log path."""
+        snapshot = ""
+        if sap is not None:
+            try:
+                snapshot = sap_ops.screen_snapshot(sap)
+            except Exception:
+                snapshot = ""
+        _popup(
+            on_event, "error", "esa-lookup -- error",
+            f"Error occurred in {step_label}:\n\n{err_text}\n\n"
+            + (f"SAP screen at the moment of failure:\n{snapshot}\n\n"
+               if snapshot else "")
+            + "The SAP window has been left exactly where it stopped.\n"
+              "Please screenshot BOTH the SAP window and this message.\n\n"
+            + _write_state_text(write_state)
+            + (f"\n\nLog file (attach it when reporting):\n{log_path}"
+               if log_path else ""))
+
     try:
         _log(on_event, f"esa-lookup starting workflow '{cfg.workflow}'", "info")
         if log_path:
@@ -1504,6 +1636,11 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
             _log(on_event, "attached to SAP GUI session", "ok")
             _diagnose(cfg.workflow, sap, on_event)
             _status(on_event, "diagnose complete -- nothing written")
+            _popup(on_event, "info", "Diagnose complete",
+                   "The ZTBV selection screens were read and dumped to the "
+                   "log. Nothing was pasted, executed, or written.\n\n"
+                   + (f"Send this log file:\n{log_path}" if log_path else
+                      "See the log pane for the results."))
             _progress(on_event, 1.0)
             on_event("done", True)
             return True
@@ -1530,6 +1667,12 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
                  f"No data below the header in column "
                  f"{_col_letter(primary_col)} (#{primary_col}) -- the "
                  f"workflow's primary input. Aborting.", "error")
+            # Notebook parity: "No TO Number found in Column K." was a
+            # message box, not a log line.
+            _popup(on_event, "error", "esa-lookup -- nothing to do",
+                   f"No data found below the header in column "
+                   f"{_col_letter(primary_col)} -- the {cfg.workflow} "
+                   f"workflow's primary input.\n\nNothing was written.")
             on_event("done", False)
             return False
         _log(on_event,
@@ -1547,9 +1690,10 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         for i, step in enumerate(steps):
             if cfg.stop_event.is_set():
                 raise Cancelled()
+            step_label = f"Step {i + 1} of {total_steps} ({step.sap_table})"
             res = _fetch_step(
                 step, vsheet, xl, sap, tmp_dir, on_event, i, total_steps,
-                cfg.stop_event,
+                cfg.stop_event, step_popups=cfg.step_popups,
             )
             if res is None:
                 continue  # no-op step (empty key column)
@@ -1568,11 +1712,15 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
                  f"DRY RUN complete: {totals_matched}/{totals_seen} "
                  f"row-matches across {total_steps} step(s); the workbook "
                  f"was not modified", "ok")
+            _popup(on_event, "info", "Dry run complete",
+                   _run_summary_lines(results)
+                   + "\n\nDRY RUN -- the workbook was NOT modified.")
             _progress(on_event, 1.0)
             on_event("done", True)
             return True
 
         # ---- Phase 2: single write-back pass + save ---------------------
+        step_label = "the final write-back to Excel"
         write_state = "partial"
         _write_back(results, xl, on_event, total_steps)
         write_state = "done"
@@ -1586,6 +1734,10 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
 
         _status(on_event, "done")
         _log(on_event, f"all steps complete: {totals_matched}/{totals_seen} row-matches across {total_steps} step(s)", "ok")
+        # Notebook parity: the "Completed." message box with the counts.
+        _popup(on_event, "info", "Completed",
+               _run_summary_lines(results) + "\n\n"
+               + _write_state_text("done"))
         _progress(on_event, 1.0)
         on_event("done", True)
         return True
@@ -1601,6 +1753,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
                  "untouched)", "info")
         else:
             _log_write_state(on_event, write_state)
+        _popup(on_event, "info", "Cancelled",
+               "The run was stopped.\n\n" + _write_state_text(write_state))
         _status(on_event, "cancelled")
         on_event("done", False)
         return False
@@ -1610,6 +1764,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         write_state = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
+        _error_popup(str(e))
         _status(on_event, "SAP error")
         on_event("done", False)
         return False
@@ -1619,6 +1774,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         write_state = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
+        _error_popup(str(e))
         _status(on_event, "Excel error")
         on_event("done", False)
         return False
@@ -1629,6 +1785,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         write_state = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
+        _error_popup(f"{type(e).__name__}: {e}")
         _status(on_event, "failed")
         on_event("done", False)
         return False

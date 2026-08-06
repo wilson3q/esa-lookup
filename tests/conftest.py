@@ -279,15 +279,37 @@ class FakeEnv:
         mp.setattr(sap_ops, "export_alv_to_file", export)
 
     # -- helpers -----------------------------------------------------------
-    def run(self, workflow="TO", dry_run=False, stop_event=None):
-        """Run the pipeline; returns (ok, joined_log_text)."""
+    def run(self, workflow="TO", dry_run=False, stop_event=None,
+            step_popups=False):
+        """Run the pipeline; returns (ok, joined_log_text).
+
+        Popup events are recorded in self.popups. A "step" popup (carrying
+        an ack Event) is auto-acknowledged immediately -- with OK by
+        default, or Cancel once self.popup_cancel_at matches its 1-based
+        order -- because nobody is around to click a message box in a test.
+        """
         self.events.clear()
+        self.popups: list = []
         cfg = pipeline.RunConfig(
             excel_path=__file__, workflow=workflow,
             stop_event=stop_event or threading.Event(), dry_run=dry_run,
+            step_popups=step_popups,
         )
         logs: list = []
-        ok = pipeline.run(cfg, lambda kind, payload: logs.append((kind, payload)))
+
+        def on_event(kind, payload):
+            logs.append((kind, payload))
+            if kind == "popup":
+                self.popups.append(payload)
+                if payload.get("ack") is not None:
+                    n_step = sum(1 for p in self.popups
+                                 if p.get("ack") is not None)
+                    if payload.get("result") is not None:
+                        payload["result"]["proceed"] = (
+                            n_step != getattr(self, "popup_cancel_at", 0))
+                    payload["ack"].set()
+
+        ok = pipeline.run(cfg, on_event)
         joined = " | ".join(p[0] for k, p in logs if k == "log")
         return ok, joined
 

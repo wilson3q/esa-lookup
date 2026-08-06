@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import pipeline
 
@@ -110,6 +110,10 @@ class App:
         self.file_var = tk.StringVar()
         self.workflow_var = tk.StringVar(value="TO")
         self.dryrun_var = tk.BooleanVar(value=False)
+        # Default ON: the ESA operator troubleshoots through message boxes
+        # (the original notebook's behavior), screenshotting them together
+        # with the SAP screen. Error popups show regardless of this flag.
+        self.popup_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._drain_queue()
@@ -188,6 +192,10 @@ class App:
             row3, text="Dry run (report matches only, write nothing)",
             variable=self.dryrun_var,
         ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            row3, text="Popup after each step",
+            variable=self.popup_var,
+        ).pack(side="left", padx=(12, 0))
         ttk.Label(
             row3, style="Hint.TLabel",
             text="   Keep this window, SAP GUI, and Excel all visible while it runs.",
@@ -258,6 +266,7 @@ class App:
             workflow=self.workflow_var.get(),
             stop_event=self.stop_event,
             dry_run=self.dryrun_var.get(),
+            step_popups=self.popup_var.get(),
         ))
 
     def _on_diagnose(self) -> None:
@@ -308,11 +317,38 @@ class App:
                     self.status_var.set(payload)
                 elif kind == "progress":
                     self.progress["value"] = float(payload) * 1000
+                elif kind == "popup":
+                    self._show_popup(payload)
                 elif kind == "done":
                     self._set_running(False)
         except queue.Empty:
             pass
         self.root.after(50, self._drain_queue)
+
+    def _show_popup(self, p: dict) -> None:
+        """Render a pipeline popup event as a modal message box (the
+        original notebook's user interface). Runs on the GUI thread; the
+        queue drain is blocked while the box is open, which is exactly the
+        blocking behavior the operator expects.
+
+        A "step" popup carries an ack Event the worker is waiting on: OK
+        continues the run, Cancel stops it. The ack MUST be set even if the
+        message box itself fails, or the worker waits forever.
+        """
+        ack = p.get("ack")
+        try:
+            if ack is not None:
+                proceed = messagebox.askokcancel(
+                    p["title"], p["message"], icon="info", parent=self.root)
+                if p.get("result") is not None:
+                    p["result"]["proceed"] = bool(proceed)
+            elif p.get("kind") == "error":
+                messagebox.showerror(p["title"], p["message"], parent=self.root)
+            else:
+                messagebox.showinfo(p["title"], p["message"], parent=self.root)
+        finally:
+            if ack is not None:
+                ack.set()
 
     def _append_log(self, msg: str, level: str = "info") -> None:
         ts = time.strftime("%H:%M:%S")

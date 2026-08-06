@@ -147,7 +147,11 @@ from win32com.client import constants  # noqa: F401 (loaded lazily by pywin32)
 PRINT_EVENT = """\
 def print_event(kind: str, payload) -> None:
     \"\"\"Simple stdout event handler for notebook use. Same (kind, payload)
-    contract the .py app's tkinter callback receives.\"\"\"
+    contract the .py app's tkinter callback receives.
+
+    Popup events (the GUI's message boxes) are printed as banners and
+    auto-acknowledged with OK, so a notebook run never blocks on a dialog
+    nobody can click.\"\"\"
     if kind == "log":
         msg, level = payload
         prefix = {"ok": "[OK]  ", "warn": "[WARN]", "error": "[ERR] ",
@@ -157,6 +161,16 @@ def print_event(kind: str, payload) -> None:
         print(f"...    {payload}")
     elif kind == "progress":
         pass  # too noisy for stdout
+    elif kind == "popup":
+        banner = "!" if payload.get("kind") == "error" else "-"
+        print(banner * 60)
+        print(f"[{payload.get('kind', 'info').upper()}] {payload['title']}")
+        print(payload["message"])
+        print(banner * 60)
+        if payload.get("ack") is not None:
+            if payload.get("result") is not None:
+                payload["result"]["proceed"] = True
+            payload["ack"].set()
     elif kind == "done":
         ok = payload
         print(f"===== workflow {'succeeded' if ok else 'FAILED'} =====")
