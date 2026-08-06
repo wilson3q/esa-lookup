@@ -108,8 +108,24 @@ class TestNotebookCarriesTheCode:
         md = _cell_sources(committed, kind="markdown")
         assert any(s.startswith("# TO Number Process") for s in md)
         assert any(s.startswith("# Notification Number Process") for s in md)
-        # the setup cell must announce itself as skippable machinery
-        assert any(s.startswith("## Setup") for s in md)
+        # There is deliberately NO setup/engine cell or concept: every name
+        # tried for one ("Engine", "helper functions", "Setup") confused
+        # the operator. The machinery ships INSIDE each process cell.
+        assert not any("setup" in s.lower() or "engine" in s.lower()
+                       for s in md)
+
+    def test_every_runnable_cell_is_self_contained(self, committed):
+        """Each cell must work in a fresh kernel with nothing run before
+        it -- that is what made the separate setup cell unnecessary. If a
+        cell loses its embedded program, running it alone breaks with
+        NameError and the setup concept sneaks back."""
+        for src in _cell_sources(committed):
+            assert "def run_process(" in src, "cell lost its embedded program"
+            assert src.count("run_process(") >= 2   # definition + call
+        # settings must sit ABOVE the program so the operator never scrolls
+        for src in _cell_sources(committed):
+            if "POPUPS = True" in src:
+                assert src.index("POPUPS = True") < src.index("def run_process(")
 
     def test_module_qualified_refs_are_rewritten(self, committed):
         """Everything is inlined into one namespace, so `sap_ops.foo(...)`
