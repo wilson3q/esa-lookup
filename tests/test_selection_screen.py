@@ -71,14 +71,27 @@ ROWS = [
 
 
 def _screen(rows=ROWS, with_labels=True, char_metric=True, tooltips=False,
-            label_pixel_offset=3):
-    """A ZTBV selection screen. `rows` is [(row, label, param, retained)]."""
+            label_pixel_offset=3, label_type="GuiLabel", separator=None):
+    """A ZTBV selection screen. `rows` is [(row, label, param, retained)].
+
+    `label_type` -- the ESA system renders field names as GuiTextField, not
+    GuiLabel, so the reader has to cope with both.
+    `separator`  -- the range word SAP prints between LOW and HIGH ("to").
+    """
     root = FakeCtl("wnd[0]/usr", "GuiUserArea", 0, 0, char_metric=char_metric)
     for row, label, param, retained in rows:
         if with_labels:
             root.add(FakeCtl(
-                f"wnd[0]/usr/lbl{param}", "GuiLabel", row, LABEL_COL,
+                f"wnd[0]/usr/lbl{param}", label_type, row, LABEL_COL,
                 text=label, pixel_offset=label_pixel_offset,
+                char_metric=char_metric))
+        if separator:
+            # sits BETWEEN the two inputs -- nearest text to the button's
+            # left, and the reason "nearest label" reported 'to' for
+            # every filter on the real screen.
+            root.add(FakeCtl(
+                f"wnd[0]/usr/sep{param}", label_type, row,
+                (LOW_COL + HIGH_COL) // 2, text=separator,
                 char_metric=char_metric))
         root.add(
             FakeCtl(f"wnd[0]/usr/ctxt{param}-LOW", "GuiCTextField", row,
@@ -185,6 +198,51 @@ class TestDescribeSelectionScreen:
     def test_low_field_id_comes_from_the_screen(self):
         got = sap_ops.describe_selection_screen(FakeSession(_screen()))
         assert got[0]["low_field"] == "wnd[0]/usr/ctxtS3-LOW"
+
+    def test_range_separator_is_not_mistaken_for_the_field_name(self):
+        """The ESA screen: field names are GuiTextField (no GuiLabel at all)
+        and SAP prints 'to' between LOW and HIGH. 'to' is the nearest text to
+        the left of the => button, so a nearest-label rule reported every one
+        of the 39 filters as 'to'. The field name is the LEFTMOST text."""
+        got = sap_ops.describe_selection_screen(
+            FakeSession(_screen(label_type="GuiTextField", separator="to")))
+        assert {f["param"]: f["label"] for f in got} == {
+            "S3": "Transfer Order Number",
+            "S15": "Number of Reservation",
+            "S29": "Notification",
+        }
+
+    def test_row_texts_are_reported_for_diagnosis(self):
+        got = sap_ops.describe_selection_screen(
+            FakeSession(_screen(label_type="GuiTextField", separator="to")))
+        assert got[0]["row_texts"] == ["Transfer Order Number", "to"]
+
+    @pytest.mark.parametrize("sep", ["to", "bis", "à", "hasta", "-"])
+    def test_separators_in_other_logon_languages(self, sep):
+        got = sap_ops.describe_selection_screen(
+            FakeSession(_screen(label_type="GuiTextField", separator=sep)))
+        assert got[0]["label"] == "Transfer Order Number"
+
+    def test_resolution_works_on_a_separator_screen(self):
+        """End to end: the exact shape that failed in production."""
+        sap_ops.PUSH_BUTTONS.pop(("Z50CFG_ENG_CRNT", "TO_NUMBER"), None)
+        rows = [(3, "TO Number", "S7", ""), (5, "Notification", "S29", "")]
+        got = sap_ops.resolve_push_button(
+            FakeSession(_screen(rows, label_type="GuiTextField",
+                                separator="to")),
+            "Z50CFG_ENG_CRNT", "TO_NUMBER")
+        assert got == sap_ops.push_button_id("S7")
+
+    def test_a_row_with_only_a_separator_reports_no_label(self):
+        """Better to say 'no label' than to name a filter 'to'."""
+        root = FakeCtl("wnd[0]/usr", "GuiUserArea", 0, 0)
+        root.add(
+            FakeCtl("wnd[0]/usr/sep", "GuiTextField", 3, 30, text="to"),
+            FakeCtl("wnd[0]/usr/btn%_S9_%_APP_%-VALU_PUSH", "GuiButton",
+                    3, BTN_COL),
+        )
+        got = sap_ops.describe_selection_screen(FakeSession(root))
+        assert got[0]["label"] == "(no label found)"
 
     def test_screen_with_no_labels_reports_them_as_missing(self):
         got = sap_ops.describe_selection_screen(

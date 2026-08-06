@@ -96,6 +96,20 @@ def open_ztbv_table(s: SapSession, table: str, log=None) -> None:
 _VALU_PUSH_RE = re.compile(r"btn%_(.+?)_%_APP_%-VALU_PUSH")
 _SELOPT_INPUT_RE = re.compile(r"(S\d+)-(LOW|HIGH)$", re.I)
 
+# The word SAP prints between a select-option's LOW and HIGH fields. It is
+# NOT a field name, but it is the closest text to the left of the '=>'
+# button, so it wins any "nearest label" rule. Logon-language dependent --
+# the leftmost-text rule in `label_for` is the real defence; this list just
+# makes a single-text row fail cleanly instead of reporting the separator.
+_RANGE_SEPARATORS = frozenset({
+    "to", "bis", "a", "à", "hasta", "até", "fino a", "tot", "till", "do",
+    "~", "-", "..",
+})
+
+
+def _is_range_separator(text: str) -> bool:
+    return text.strip().lower() in _RANGE_SEPARATORS
+
 
 def _attr(c, name: str, default: str = "") -> str:
     try:
@@ -240,15 +254,33 @@ def describe_selection_screen(s, log=None) -> list[dict]:
         if it["tooltip"]:
             tooltip_by_param[param] = it["tooltip"]
 
+    def row_texts(btn) -> list[str]:
+        """Every text on the button's row, left to right. Carried into the
+        result so a mis-picked label can be diagnosed from one log."""
+        brow, bcol = row_of(btn), col_of(btn)
+        return [l["text"] for l in
+                sorted((l for l in labels
+                        if row_of(l) == brow and col_of(l) < bcol),
+                       key=col_of)]
+
+    # A select-options row reads:
+    #     [field name]  [LOW]  "to"  [HIGH]  [=> button]
+    # The RANGE SEPARATOR is therefore the nearest text to the left of the
+    # button and never the field name -- a "nearest label" rule reported all
+    # 39 filters on the ESA screen as 'to'. Two defences: separators are not
+    # label candidates at all, and the field name is taken as the LEFTMOST
+    # text on the row rather than the nearest.
+    named = [l for l in labels if not _is_range_separator(l["text"])]
+
     def label_for(btn) -> str:
         brow, bcol = row_of(btn), col_of(btn)
-        same_row = [l for l in labels if abs(row_of(l) - brow) == 0]
+        same_row = [l for l in named if row_of(l) == brow]
         left = [l for l in same_row if col_of(l) < bcol]
         if left:
-            return max(left, key=col_of)["text"]
+            return min(left, key=col_of)["text"]
         if same_row:
             return min(same_row, key=col_of)["text"]
-        near = [l for l in labels if abs(row_of(l) - brow) <= row_slack]
+        near = [l for l in named if abs(row_of(l) - brow) <= row_slack]
         if near:
             return min(near, key=lambda l: (abs(row_of(l) - brow), -col_of(l)))["text"]
         return ""
@@ -261,10 +293,12 @@ def describe_selection_screen(s, log=None) -> list[dict]:
         param = m.group(1).upper()
         label = label_for(it)
         tooltip = tooltip_by_param.get(param, "")
+        texts = row_texts(it)
         out.append({
             "param": param,
             "label": label or "(no label found)",
             "tooltip": tooltip,
+            "row_texts": texts,
             "push_id": it["id"],
             "low_field": low_field_by_param.get(
                 param, f"wnd[0]/usr/ctxt{param}-LOW"),
@@ -273,7 +307,8 @@ def describe_selection_screen(s, log=None) -> list[dict]:
         })
         if log:
             log(f"SAP: filter {param:<6} label={label or '(none)'!r}"
-                + (f" tooltip={tooltip!r}" if tooltip else ""))
+                + (f" tooltip={tooltip!r}" if tooltip else "")
+                + (f" row={texts}" if len(texts) > 1 else ""))
     if not out:
         raise SapError(
             "No multi-value filter buttons found. Is the ZTBV selection "
@@ -717,9 +752,13 @@ def resolve_push_button(s, table: str, field: str, log=None) -> str:
                 if any(syn in f["tooltip"].lower() for syn in synonyms)]
         matched_on = "tooltip"
     if len(hits) != 1:
+        # Print every text on each row, not just the one picked as the label:
+        # if the pick is wrong, the right answer is already in this listing.
         listing = "\n".join(
             f"  {f['param']:<6} label={f['label']!r}"
             + (f" tooltip={f['tooltip']!r}" if f["tooltip"] else "")
+            + (f" row={f['row_texts']}" if len(f.get("row_texts", [])) > 1
+               else "")
             for f in filters)
         raise SapError(
             f"Could not resolve the {field} filter on {table}: "
