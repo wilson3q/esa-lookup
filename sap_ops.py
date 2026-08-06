@@ -662,6 +662,14 @@ PUSH_BUTTONS = {
     ("LTAP", "TO_NUMBER"): "wnd[0]/usr/btn%_S3_%_APP_%-VALU_PUSH",
     ("Z50CFG_ENG_CRNT", "RSNUM"): "wnd[0]/usr/btn%_S15_%_APP_%-VALU_PUSH",
     ("Z50CFG_ENG_CRNT", "QMNUM"): "wnd[0]/usr/btn%_S29_%_APP_%-VALU_PUSH",
+    # Read off the ESA ZTBV 'Table Display' screen (2026-08). That screen
+    # carries 39 select-options, S2..S40, one per field in screen order, so
+    # the slot is the field's position + 1. Two independent checks against
+    # the mappings recorded from the original working notebook confirm the
+    # offset: 'Number of Reservation/Depend' is field 14 -> S15 (= RSNUM
+    # above) and 'Notification No' is field 28 -> S29 (= QMNUM above).
+    # 'Transfer Order Number' is field 18 -> S19.
+    ("Z50CFG_ENG_CRNT", "TO_NUMBER"): "wnd[0]/usr/btn%_S19_%_APP_%-VALU_PUSH",
     ("Z50CFG_ENG_VALD", "OBJNR"): "wnd[0]/usr/btn%_S2_%_APP_%-VALU_PUSH",
 }
 
@@ -674,6 +682,24 @@ FIELD_LABEL_SYNONYMS = {
     "RSNUM": ["reservation"],
     "QMNUM": ["notification", "notifctn"],
     "OBJNR": ["object"],
+}
+
+# Label fragments that RULE a filter OUT for a field, applied only to break a
+# tie. Every field we look up is paired on the ESA screen with a neighbour
+# that matches the same synonym:
+#
+#   'Transfer Order Number'          vs 'Transfer order item'
+#   'Number of Reservation/Depend'   vs 'Item Number of Reservation/D'
+#   'Notification No'                vs 'Notification Type'
+#
+# Each of these wants the NUMBER, never the item or the type. Without this,
+# resolution correctly refuses as ambiguous -- safe, but it stops the run.
+# Same failure mode as RSPOS once binding to the TO item (3d8644f).
+FIELD_LABEL_EXCLUSIONS = {
+    "TO_NUMBER": ["item", "itm", "pos"],
+    "RSNUM": ["item", "itm", "pos"],
+    "QMNUM": ["type", "typ"],
+    "OBJNR": ["type", "typ"],
 }
 
 
@@ -742,14 +768,26 @@ def resolve_push_button(s, table: str, field: str, log=None) -> str:
             f"PUSH_BUTTONS in sap_ops.")
 
     filters = describe_selection_screen(s, log=log)
-    hits = [f for f in filters
-            if any(syn in f["label"].lower() for syn in synonyms)]
+    exclusions = FIELD_LABEL_EXCLUSIONS.get(field, [])
+
+    def pick(attr: str) -> list[dict]:
+        hits = [f for f in filters
+                if any(syn in f[attr].lower() for syn in synonyms)]
+        # Only break a tie with the exclusions -- never let them turn a
+        # single clean hit into no hit at all.
+        if len(hits) > 1 and exclusions:
+            narrowed = [f for f in hits
+                        if not any(x in f[attr].lower() for x in exclusions)]
+            if len(narrowed) == 1:
+                return narrowed
+        return hits
+
+    hits = pick("label")
     matched_on = "label"
     if not hits:
         # Tooltips are only consulted when no label matched -- consulting both
         # at once would turn a clean single label hit into an ambiguity error.
-        hits = [f for f in filters
-                if any(syn in f["tooltip"].lower() for syn in synonyms)]
+        hits = pick("tooltip")
         matched_on = "tooltip"
     if len(hits) != 1:
         # Print every text on each row, not just the one picked as the label:

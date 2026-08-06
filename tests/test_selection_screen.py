@@ -285,9 +285,21 @@ class TestResolvePushButton:
         assert sap_ops.PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "TO_NUMBER")] == \
             sap_ops.push_button_id("S7")
 
-    def test_ambiguous_labels_refuse_rather_than_guess(self):
+    def test_an_item_neighbour_loses_the_tie_to_the_number(self):
+        """'TO Number' vs 'TO Number Item' -- the item field must never win.
+        Same failure mode as RSPOS once binding to the TO item (3d8644f)."""
         sap_ops.PUSH_BUTTONS.pop(("Z50CFG_ENG_CRNT", "TO_NUMBER"), None)
         rows = [(3, "TO Number", "S7", ""), (5, "TO Number Item", "S8", "")]
+        got = sap_ops.resolve_push_button(
+            FakeSession(_screen(rows)), "Z50CFG_ENG_CRNT", "TO_NUMBER")
+        assert got == sap_ops.push_button_id("S7")
+
+    def test_ambiguous_labels_refuse_rather_than_guess(self):
+        """Two equally plausible labels that no exclusion separates. Refusing
+        is right: pasting keys into the wrong filter returns confidently
+        wrong data, which is worse than stopping."""
+        sap_ops.PUSH_BUTTONS.pop(("Z50CFG_ENG_CRNT", "TO_NUMBER"), None)
+        rows = [(3, "TO Number", "S7", ""), (5, "Transfer Order", "S8", "")]
         with pytest.raises(sap_ops.SapError, match="2 candidate"):
             sap_ops.resolve_push_button(
                 FakeSession(_screen(rows)), "Z50CFG_ENG_CRNT", "TO_NUMBER")
@@ -325,20 +337,82 @@ class TestResolvePushButton:
         assert sap_ops.resolve_push_button(None, "LTAP", "TO_NUMBER") == \
             sap_ops.push_button_id("S4")
 
+    def test_esa_screen_resolves_every_field_we_look_up(self):
+        """The real ESA Z50CFG_ENG_CRNT 'Table Display' screen, transcribed
+        from a screenshot: 39 select-options, S2..S40, one per field in
+        screen order.
+
+        Every field this app looks up is paired on that screen with a
+        neighbour matching the same synonym -- 'Transfer Order Number' next
+        to 'Transfer order item', 'Number of Reservation/Depend' next to
+        'Item Number of Reservation/D', 'Notification No' next to
+        'Notification Type'. Each pick must land on the NUMBER.
+        """
+        fields = [
+            "Disposition ID", "Object number", "Disposition material",
+            "Quantity Dispositioned", "Disposition Date", "Disposition time",
+            "Batch Number", "Plant for batch", "Serial Number", "User Name",
+            "Part Status", "Assigned Material", "Assigned Quantity",
+            "Number of Reservation/Depend", "Item Number of Reservation/D",
+            "Internal table flag", "Order Number", "Transfer Order Number",
+            "Transfer order item", "Not More Closely Defined Are",
+            "Valid flag", "Checkbox", "Transaction Code",
+            "Warehouse Number / Warehouse", "Notification Type",
+            "Order Number", "Purchasing Document Number", "Notification No",
+            "Equipment Number", "Valuation Type", "Special Stock Indicator",
+            "Serial Number", "Batch Number", "Character field, length 70",
+            "Character field, length 70", "Character field, length 70",
+            "Equipment rec create or chan", "PBOM Use Code",
+            "Gate III Critical Part Flag",
+        ]
+        # slot = position + 1, i.e. the first field is S2
+        rows = [(3 + i, name, f"S{i + 2}", "") for i, name in enumerate(fields)]
+        screen = _screen(rows, label_type="GuiTextField", separator="to")
+
+        assert len(fields) == 39, "the run log reported 39 filters, S2..S40"
+
+        for field, expected_label, expected_slot in [
+            ("TO_NUMBER", "Transfer Order Number", "S19"),
+            ("RSNUM", "Number of Reservation/Depend", "S15"),
+            ("QMNUM", "Notification No", "S29"),
+        ]:
+            sap_ops.PUSH_BUTTONS.pop(("Z50CFG_ENG_CRNT", field), None)
+            got = sap_ops.resolve_push_button(
+                FakeSession(screen), "Z50CFG_ENG_CRNT", field)
+            assert got == sap_ops.push_button_id(expected_slot), (
+                f"{field} resolved to {got}, expected {expected_slot} "
+                f"({expected_label})")
+
+    def test_recorded_slots_agree_with_the_screen(self):
+        """The recorded RSNUM/QMNUM slots came from the original working
+        notebook; the TO_NUMBER slot was derived from the screenshot by
+        position. If the derivation is right, reading the screen by LABEL
+        must independently produce the same three answers -- which is what
+        the test above checks. This pins the recorded values themselves so a
+        typo in PUSH_BUTTONS cannot slip through."""
+        assert sap_ops.PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "RSNUM")] == \
+            sap_ops.push_button_id("S15")
+        assert sap_ops.PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "QMNUM")] == \
+            sap_ops.push_button_id("S29")
+        assert sap_ops.PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "TO_NUMBER")] == \
+            sap_ops.push_button_id("S19")
+
     def test_unknown_field_with_no_synonyms_raises(self):
         with pytest.raises(sap_ops.SapError, match="no label synonyms"):
             sap_ops.resolve_push_button(
                 FakeSession(_screen()), "LTAP", "NOT_A_FIELD")
 
-    def test_only_TO_step2_depends_on_reading_the_screen(self, monkeypatch):
+    def test_no_step_depends_on_reading_the_screen(self, monkeypatch):
         """Blast radius of the screen reader, stated as a fact about the
         workflows rather than a claim in a commit message.
 
         Every step whose (table, field) is recorded in PUSH_BUTTONS resolves
-        without reading the screen -- so a change to the reader cannot affect
-        it. Today that is every step except TO step 2, which is the one that
-        fails in the field. If this list grows, a reader change has become
-        able to break a step that used to work, and that is worth knowing.
+        without reading the screen, so a change to the reader cannot affect
+        it. Since Z50CFG_ENG_CRNT/TO_NUMBER was pinned to S19 that is now
+        EVERY step in both workflows -- label reading is a fallback for
+        unrecorded pairs and the Diagnose run, not something a normal run
+        depends on. If this list grows, a reader change has become able to
+        break a step that works today, and that is worth knowing.
         """
         import pipeline
 
@@ -356,5 +430,4 @@ class TestResolvePushButton:
                     needs_screen.append(
                         f"{name} step {i}: {step.sap_table}/"
                         f"{step.push_button_field}")
-        assert needs_screen == [
-            "TO step 2: Z50CFG_ENG_CRNT/TO_NUMBER"], needs_screen
+        assert needs_screen == [], needs_screen
