@@ -128,8 +128,6 @@ IMPORTS = """\
 from __future__ import annotations
 
 import contextlib
-import difflib
-import io
 import os
 import re
 import sys
@@ -141,7 +139,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
-import pandas as pd
 import pythoncom
 import win32com.client
 from win32com.client import constants  # noqa: F401 (loaded lazily by pywin32)
@@ -312,7 +309,7 @@ run_process("NOTIF", excel_path=EXCEL_PATH, popups=POPUPS, dry_run=DRY_RUN)
 """
 
 DIAGNOSE_CELL = """\
-# Only needed when a run stops with "Could not resolve the ... filter".
+# Only needed when a run stops with "No filter slot recorded for ...".
 # Reads the ZTBV selection screens for the chosen process and prints which
 # S<n> filter slot is which. No Excel file, no query, nothing written.
 # Send the log file it names.
@@ -321,8 +318,8 @@ DIAGNOSE_CELL = """\
 # the next line only when you need it, then run this cell:
 # run_process("TO", diagnose=True)          # or "NOTIF"
 
-# If Diagnose names the right slot, pin it here and re-run your process --
-# example (uncomment and adjust):
+# If Diagnose names the right slot, either edit PUSH_BUTTONS in the SAP
+# utilities cell, or pin it here for this session (uncomment and adjust):
 # PUSH_BUTTONS[("Z50CFG_ENG_CRNT", "RSNUM")] = push_button_id("S15")
 print("Diagnose cell: nothing to do (see the comments in this cell).")
 """
@@ -369,8 +366,8 @@ exactly as they were).
 ## How to use -- 3 actions
 
 1. Log into SAP GUI and open the workbook in Excel (or know its path).
-2. Run the **Utility class for data pulling** cell first. Nothing to
-   read or change in it, and running it again is always harmless.
+2. Run the three **Utility** cells first (top to bottom). Running them
+   again is always harmless.
 3. Run YOUR process cell: **TO Number Process** or **Notification Number
    Process**. With `POPUPS = True` every step is **written and saved**,
    then its message box shows the counts -- switch to Excel and look at
@@ -383,7 +380,7 @@ process -- the second pass fills the notification-only rows (usually most
 of the sheet).
 
 **Cell -> Run All works too**, and runs exactly that order: the utility
-class, TO
+cells, TO
 process, Notification process. You browse to the workbook once; the second
 process re-uses it automatically. If a process fails or you press Cancel,
 the cells after it are stopped. The Diagnose cell at the bottom never runs
@@ -394,19 +391,46 @@ Every run also writes a log file to `%LOCALAPPDATA%\\esa-lookup\\logs\\`
 """),
 
     md("""\
-## Utility class for data pulling -- always run this cell first
+## Utility class for data pulling -- always run these cells first
 
-The data-pulling utilities both processes use: Excel read/write, SAP GUI
-scripting, and the step runner. **Nothing in here needs reading or
-editing.** Just run it, then go to your process below. Running it again at
-any time is harmless. It is auto-generated from the app's source files by
-`build_notebook.py`; to change behavior, change those files and regenerate.
-Do not hand-edit this notebook.
+The data-pulling utilities both processes use, in three readable parts:
+**Excel**, **SAP GUI**, and the **process runner**. Run all three, then go
+to your process below. Running them again at any time is harmless.
+
+These cells are meant to be read and understood -- open the part you care
+about. They are generated from the app's source files (`excel_ops.py`,
+`sap_ops.py`, `pipeline.py`) by `build_notebook.py`: for a permanent
+change, edit those files and regenerate (a quick experiment directly in a
+cell works too -- just copy the change back).
+"""),
+    md("""\
+### Utility 1 of 3 -- Excel
+
+Attach to the workbook, bulk read/write ranges, stage filter values on the
+clipboard for SAP.
 """),
     code(IMPORTS
-         + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))
-         + "\n\n" + rename_sap_ops(strip_header(read_py("sap_ops.py")))
-         + "\n\n" + rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))
+         + "\n\n" + rename_excel_ops(strip_header(read_py("excel_ops.py")))),
+
+    md("""\
+### Utility 2 of 3 -- SAP GUI
+
+Attach to the SAP session, open ZTBV, paste the filter (clipboard, with a
+leftover-clear first), run the query, read the result grid by technical
+field name. `PUSH_BUTTONS` records which S<n> filter slot each field uses
+-- the one dict to edit if SAP's screen ever changes.
+"""),
+    code(rename_sap_ops(strip_header(read_py("sap_ops.py")))),
+
+    md("""\
+### Utility 3 of 3 -- Process runner
+
+The step definitions (`WORKFLOWS` -- which columns are read and written),
+the template-formula splits (scan -> K/L, unloading point -> N/O), key
+normalization, the step runner with popups and per-run log files, and
+`run_process()`.
+"""),
+    code(rewrite_pipeline_refs(strip_header(read_py("pipeline.py")))
          + "\n\n" + ENGINE_TAIL),
 
     md("""\

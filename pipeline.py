@@ -11,8 +11,6 @@ render them from its main thread.
 """
 from __future__ import annotations
 
-import difflib
-import io
 import os
 import re
 import sys
@@ -24,7 +22,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
-import pandas as pd
 import pythoncom  # Fix H: worker-thread COM apartment init
 
 import excel_ops
@@ -60,7 +57,7 @@ SAP_FILTER_CHUNK_SIZE = 2000
 
 
 def _clean_cell(value) -> str:
-    """Turn a raw Excel/pandas value into a stripped string, treating None,
+    """Turn a raw Excel value into a stripped string, treating None,
     NaN, and pywintypes cell-error ints as empty.
     - Fix B: str(float('nan')) is 'nan' -- filter NaN before it becomes a key.
     - Fix G: #N/A / #REF! / #VALUE! come back from Excel COM as large-negative
@@ -521,311 +518,27 @@ def _range(col_start: int, col_end: int, row_start: int, row_end: int) -> str:
     )
 
 
-# Fix 3: SAP ALV exports typically use the ALV column TITLE, which is often a
-# short description rather than the technical field name. Try the technical
-# name first, then any known aliases. Extend per-site if needed.
-SAP_COLUMN_ALIASES: dict[str, list[str]] = {
-    "TANUM":       ["TANUM", "TO Number", "TO No.", "Transfer Order", "TrfOrd", "TrfOrdNo"],
-    # "Unl. Point" is what the ESA ZTBV layout actually prints for ABLAD --
-    # the ALV shows English short labels, not technical names.
-    "ABLAD":       ["ABLAD", "Unl. Point", "Unloading Point", "UnloadPt"],
-    "QMNUM":       ["QMNUM", "Notifctn", "Notification", "Notification No", "Notification Number"],
-    "RSNUM":       ["RSNUM", "Reserv.No.", "Reservation", "Reservation No", "Reservation Number", "Res.Number"],
-    # ORDER MATTERS. The Z50CFG_ENG_CRNT layout carries BOTH pairs side by
-    # side: 'Reserv.No.' + 'Itm' (the reservation) and 'TO Number' + 'Item'
-    # (the transfer order). RSPOS is the RESERVATION item, so 'Itm' has to
-    # be tried before the generic 'Item' -- otherwise RSPOS silently binds
-    # to the TO item, resolution "succeeds", and step 2 keys on a mismatched
-    # pair that quietly matches nothing.
-    "RSPOS":       ["RSPOS", "Itm", "Res.Item", "Item No", "Item Number", "Item"],
-    "OBJNR":       ["OBJNR", "Object number", "Object Number", "Obj.Number", "Object No"],
-    "DISP_MATNR":  ["DISP_MATNR", "Disp Matl", "Disp Material", "Disposition Material", "Disp.Material"],
-    "DISP_QTY":    ["DISP_QTY", "Disp Qty", "Disposition Qty", "Disposition Quantity", "Disp.Qty"],
-    "Z_SECTION":   ["Z_SECTION", "Section"],
-    "Z_MODULE":    ["Z_MODULE", "Module"],
-    "DESCRIPT":    ["DESCRIPT", "Description", "Descr."],
-    "SALES_ORDER": ["SALES_ORDER", "Sales Order", "Sales Doc.", "Sales Doc", "Sales Doc. No."],
-    "LID":         ["LID"],
-}
-
-
-def _norm_col(name) -> str:
-    """Fold an ALV column title for tolerant comparison: case, spaces, and
-    the punctuation SAP sprinkles through its abbreviations all ignored, so
-    "Unl. Point" / "Unl.Point" / "UNL POINT" are one name.
-    """
-    return re.sub(r"[\s._\-/]+", "", str(name)).lower()
-
-
-def _resolve_column(df: pd.DataFrame, canonical: str) -> str | None:
-    """Return whichever of `canonical`'s alias names is present in df, or None.
-
-    Exact match first, then the folded comparison -- an ALV variant that
-    prints "Unl.Point" should still resolve an alias spelled "Unl. Point"
-    without needing a separate entry for every punctuation variant.
-    """
-    aliases = SAP_COLUMN_ALIASES.get(canonical, [canonical])
-    for name in aliases:
-        if name in df.columns:
-            return name
-    folded: dict[str, list[str]] = {}
-    for actual in df.columns:
-        folded.setdefault(_norm_col(actual), []).append(actual)
-    for name in aliases:
-        hits = folded.get(_norm_col(name))
-        if hits:
-            return hits[0]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Reading whatever SAP actually exported
-# ---------------------------------------------------------------------------
-
-# SAP names every ALV export ".xlsx", but only the `&XXL` path really writes
-# one. When `&XXL` is unavailable (older SAP GUI build, or no Excel/XXL
-# frontend integration -- it fails with "The control could not be found"),
-# `sap_ops.export_alv_to_file` falls back to `&PC` "Save as Local File",
-# which writes a DELIMITED TEXT file under that same .xlsx name. Feeding
-# that to pd.read_excel dies with "Excel file format cannot be determined,
-# you must specify an engine manually".
-#
-# Independently, on sites whose Office integration is enabled, the `&XXL`
-# path itself can write an MHTML-wrapped <table> under the .xlsx name --
-# openpyxl rejects that one with "not a zip file".
-#
-# So the extension tells us nothing: sniff the real format from the leading
-# bytes and dispatch on that.
-
-_ZIP_MAGIC = b"PK\x03\x04"          # .xlsx / OOXML (a zip container)
-_OLE2_MAGIC = b"\xd0\xcf\x11\xe0"   # legacy .xls (BIFF8 inside OLE2)
-
-
-def _decode_sap_text(raw: bytes) -> str:
-    """Decode an SAP text export: honour the BOM SAP writes on Unicode
-    systems, else fall back to the Windows frontend codepage.
-    """
-    for bom, enc in ((b"\xff\xfe\x00\x00", "utf-32"),
-                     (b"\x00\x00\xfe\xff", "utf-32"),
-                     (b"\xff\xfe", "utf-16"),
-                     (b"\xfe\xff", "utf-16"),
-                     (b"\xef\xbb\xbf", "utf-8-sig")):
-        if raw.startswith(bom):
-            return raw.decode(enc)
-    for enc in ("utf-8", "cp1252"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin-1", "replace")
-
-
-def _sap_text_to_frame(text: str) -> pd.DataFrame:
-    """Parse an SAP `&PC` export -- either the tab-delimited "Spreadsheet"
-    format or the pipe-ruled "unconverted" list format -- into a DataFrame.
-
-    Every cell stays a string. SAP already formatted the values the way the
-    ALV displayed them, and keeping them verbatim preserves leading zeros on
-    material / TO numbers that pandas' numeric inference would eat.
-    `normalize_key` canonicalizes both sides of the join anyway, so string
-    cells match exactly the rows numeric cells would.
-    """
-    lines = []
-    for ln in text.splitlines():
-        s = ln.strip()
-        # skip blanks and ALV list rulers: "--------" / "|----+----|"
-        if not s or set(s) <= set("-+| "):
-            continue
-        lines.append(ln)
-    if not lines:
-        return pd.DataFrame()
-
-    if sum(ln.count("|") for ln in lines) > sum(ln.count("\t") for ln in lines):
-        rows = [[c.strip() for c in ln.strip().strip("|").split("|")]
-                for ln in lines]
-    else:
-        rows = [[c.strip() for c in ln.split("\t")] for ln in lines]
-
-    # SAP prefixes some list exports with report title / run-date lines that
-    # carry fewer fields than the table. The real header row is the first one
-    # with the table's own field count (the most common width).
-    widths = [len(r) for r in rows]
-    modal = max(set(widths), key=widths.count)
-    first = widths.index(modal)
-    # Rows of a different width are footers ("3 record(s) selected") or wrapped
-    # lines; dropping them can only UNDER-count, which the caller's
-    # grid_rows comparison turns into a loud error rather than silent loss.
-    rows = [r for r in rows[first:] if len(r) == modal]
-
-    header = [h or f"Unnamed: {i}" for i, h in enumerate(rows[0])]
-    return pd.DataFrame(rows[1:], columns=header)
-
-
-def _read_sap_export(path: str, log=None) -> pd.DataFrame:
-    """Read the file `sap_ops.export_alv_to_file` produced, whatever format
-    SAP actually chose for it.
-    """
-    with open(path, "rb") as fh:
-        raw = fh.read()
-    head = raw[:2048]
-
-    # dtype=str everywhere: pandas' numeric inference would eat the
-    # leading zeros of encoded values -- the ESA unloading point
-    # '00000001000001' must not come back as the number 1000001, or the
-    # reservation split (and any key match on it) silently corrupts.
-    # normalize_key canonicalizes both sides of every join, so all-string
-    # frames match exactly the rows inferred-numeric frames would.
-    if head.startswith(_ZIP_MAGIC):
-        return pd.read_excel(path, engine="openpyxl", dtype=str)
-
-    if head.startswith(_OLE2_MAGIC):
-        try:
-            return pd.read_excel(path, engine="xlrd", dtype=str)
-        except ImportError as e:
-            raise RuntimeError(
-                f"SAP exported a legacy .xls workbook ({path}); reading it "
-                f"needs the 'xlrd' package -- run: pip install xlrd"
-            ) from e
-
-    # MHTML / HTML: some sites' Office integration makes "Export as
-    # Spreadsheet" write an MHTML-wrapped <table> under the .xlsx name.
-    # The MIME preamble has to be sliced off before read_html sees it.
-    lowered = head.lower()
-    payload = None
-    if b"mime-version:" in lowered or b"content-location:" in lowered:
-        i = raw.lower().find(b"<html")
-        if i < 0:
-            raise RuntimeError(
-                f"SAP export {path} looks like MHTML but no <html> body was "
-                f"found.")
-        payload = raw[i:]
-    elif b"<html" in lowered or b"<table" in lowered:
-        payload = raw
-
-    if payload is not None:
-        # Must be a file-like object: pandas >=3 treats a bytes/str argument
-        # as a PATH, so passing the markup itself raises FileNotFoundError.
-        try:
-            tables = pd.read_html(io.BytesIO(payload))
-        except ImportError as e:
-            raise RuntimeError(
-                f"SAP exported an HTML/MHTML table ({path}); reading it needs "
-                f"the 'lxml' package -- run: pip install lxml"
-            ) from e
-        if not tables:
-            raise RuntimeError(
-                f"SAP export {path}: no <table> found in the HTML body.")
-        return tables[0]
-
-    text = _decode_sap_text(raw)
-    if log:
-        log("SAP: export is a delimited text file (&PC fallback), not xlsx -- "
-            "parsing as text")
-    df = _sap_text_to_frame(text)
-    # We only get here for a grid that reported rows (the caller skips empty
-    # grids), so a frame with no data rows means the file is not a delimited
-    # export at all -- say so instead of failing later on missing columns.
-    if df.empty:
-        raise RuntimeError(
-            f"Could not parse the SAP export at {path}: it is neither an "
-            f"xlsx/xls workbook nor a recognizable delimited text export. "
-            f"Open it manually to see what ZTBV actually wrote."
-        )
-    return df
-
-
 def _build_lookup(
-    df: pd.DataFrame,
+    records: list[dict],
     key_cols: list[str],
     value_cols: list[str],
 ) -> tuple[dict, int, int]:
-    """Return (lookup, dup_count, blank_key_count) built from df.
+    """Turn the grid rows into {composite_key: {value_col: value}}.
 
-    Resolves each canonical SAP field name (e.g. "TANUM") to whichever alias
-    (e.g. "TO Number") the ALV export actually used.
+    Rows come straight off the ALV grid by TECHNICAL field name, so the
+    keys of each record dict are exactly the names in key_cols/value_cols.
 
-    Fix C: duplicate composite keys keep the FIRST occurrence and increment
-    dup_count so the caller can warn -- overwriting silently loses data when
-    a lookup table legitimately has multiple rows per key.
-
-    Fix D: rows where ANY key part is blank are skipped, not just rows where
-    ALL parts are blank. A composite of "12345|" would otherwise falsely
-    match every SAP row with the same first part and a blank second.
+    Returns (lookup, dup_count, blank_key_count):
+    - duplicate composite keys keep the FIRST occurrence (dup_count tells
+      the caller to warn -- silently overwriting would lose data);
+    - rows where ANY key part is blank are skipped (a composite "12345|"
+      would falsely match every row sharing the first part).
     """
-    needed = list(dict.fromkeys(key_cols + value_cols))
-    resolved: dict[str, str] = {}
-    missing: list[str] = []
-    for c in needed:
-        r = _resolve_column(df, c)
-        if r is None:
-            missing.append(c)
-        else:
-            resolved[c] = r
-    if missing:
-        # Name the closest present titles: the ALV prints English short
-        # labels ("Unl. Point" for ABLAD), so the field is usually right
-        # there under a name no alias lists yet. Guessing it here saves a
-        # round trip to whoever is standing at the customer's machine.
-        hints = []
-        for c in missing:
-            near = difflib.get_close_matches(
-                c, [str(x) for x in df.columns], n=3, cutoff=0.4)
-            for alias in SAP_COLUMN_ALIASES.get(c, []):
-                near += difflib.get_close_matches(
-                    alias, [str(x) for x in df.columns], n=3, cutoff=0.6)
-            near = list(dict.fromkeys(near))[:3]
-            if near:
-                hints.append(f"  {c}: closest titles present are {near}")
-        raise RuntimeError(
-            "SAP export is missing these expected columns: "
-            f"{missing}\n"
-            f"Columns present in the export: {list(df.columns)}\n"
-            + ("Did you mean:\n" + "\n".join(hints) + "\n" if hints else "")
-            + "Fix: edit the ALV layout in ZTBV so each missing field is shown "
-            "(prefer 'Technical Name' as the column title) and re-save the "
-            "default variant, OR add another alias to SAP_COLUMN_ALIASES in "
-            "pipeline.py."
-        )
-
-    # A title repeated in the layout makes df[title] a DataFrame slice, so
-    # row[title] is a Series -- normalize_key would stringify the whole
-    # Series and pd.isna would raise "truth value is ambiguous". The ESA
-    # LTAP layout repeats 'Item', 'Typ', 'Sec' and 'B.pos' several times,
-    # so fail loudly here rather than write nonsense into the workbook.
-    titles = [str(x) for x in df.columns]
-    ambiguous = {c: r for c, r in resolved.items() if titles.count(str(r)) > 1}
-    if ambiguous:
-        raise RuntimeError(
-            "These SAP fields resolved to a column title that appears more "
-            "than once in the export, so the right one cannot be told apart:\n"
-            + "\n".join(f"  {c} -> {r!r} (appears {titles.count(str(r))} times)"
-                        for c, r in ambiguous.items())
-            + "\nFix: edit the ALV layout in ZTBV to show 'Technical Name' as "
-            "the column title (which is unique per field), or remove the "
-            "duplicate columns from the layout and re-save the variant."
-        )
-
-    # Two SAP fields landing on one column means an alias list is too greedy
-    # (the way RSPOS's generic "Item" once outranked the reservation's own
-    # "Itm"). Resolution would "succeed" and the step would then key on a
-    # field it was never meant to read, so refuse rather than guess.
-    collisions: dict[str, list[str]] = {}
-    for c, r in resolved.items():
-        collisions.setdefault(str(r), []).append(c)
-    clashing = {r: cs for r, cs in collisions.items() if len(cs) > 1}
-    if clashing:
-        raise RuntimeError(
-            "These SAP fields all resolved to the SAME export column, so at "
-            "least one of them is bound to the wrong field:\n"
-            + "\n".join(f"  {cs} -> {r!r}" for r, cs in clashing.items())
-            + "\nFix: tighten the alias lists in SAP_COLUMN_ALIASES so each "
-            "field matches its own column title first."
-        )
     out: dict[str, dict] = {}
     dup_count = 0
     blank_key_count = 0
-    for _, row in df.iterrows():
-        parts = [normalize_key(row[resolved[c]]) for c in key_cols]
+    for row in records:
+        parts = [normalize_key(row.get(c)) for c in key_cols]
         if any(p == "" for p in parts):
             blank_key_count += 1
             continue
@@ -833,10 +546,8 @@ def _build_lookup(
         if composite in out:
             dup_count += 1
             continue  # keep first occurrence -- do not silently overwrite
-        out[composite] = {
-            c: ("" if pd.isna(row[resolved[c]]) else row[resolved[c]])
-            for c in value_cols
-        }
+        out[composite] = {c: ("" if row.get(c) is None else row.get(c))
+                          for c in value_cols}
     return out, dup_count, blank_key_count
 
 
@@ -909,7 +620,6 @@ def _fetch_step(
     vsheet: VirtualSheet,
     xl: excel_ops.ExcelCtx,
     sap: sap_ops.SapSession,
-    tmp_dir: str,
     on_event: EventFn,
     step_index: int,
     total_steps: int,
@@ -1055,11 +765,10 @@ def _fetch_step(
     _log(on_event, f"{len(unique_paste_values)} unique key(s) will be sent to SAP")
     sub_progress(2)
 
-    # --- 2. Query SAP in chunks: navigate, paste, execute, verify, export
-    # Item 2: large key lists are split so a single oversized multi-select
-    # paste can't overload the selection screen or produce an unmanageable
-    # export. Each chunk is a full navigate->paste->execute->export round;
-    # chunk results are concatenated before matching.
+    # --- 2. Query SAP in chunks: navigate, paste, execute, read grid ----
+    # Large key lists are split so one oversized multi-select paste cannot
+    # overload the selection screen. Each chunk is a full navigate ->
+    # paste -> execute -> read round; results are combined before matching.
     chunks = [
         unique_paste_values[i:i + SAP_FILTER_CHUNK_SIZE]
         for i in range(0, len(unique_paste_values), SAP_FILTER_CHUNK_SIZE)
@@ -1069,23 +778,16 @@ def _fetch_step(
              f"splitting {len(unique_paste_values)} key(s) into {len(chunks)} "
              f"chunk(s) of <= {SAP_FILTER_CHUNK_SIZE}")
 
-    # Resolved on the first chunk, after open_ztbv_table has the selection
-    # screen up -- a (table, field) pair missing from PUSH_BUTTONS is then
-    # found by its on-screen label instead of failing.
-    push_id: str | None = None
-    frames: list[pd.DataFrame] = []
-    ts = int(time.time())
+    push_id = sap_ops.resolve_push_button(
+        sap, step.sap_table, step.push_button_field)
     # Every SAP field this step needs, by technical name -- what the grid
-    # reader asks for, and exactly what the original notebook read.
+    # reader asks for, exactly as the original notebook read them.
     wanted_cols = list(dict.fromkeys(
         step.sap_key_columns
         + step.sap_output_columns
         + [e.sap_col for e in step.extras if e.sap_col]
     ))
-    # One export fallback decision per step, not per chunk: if the grid read
-    # is unavailable here it will be unavailable for every other chunk too,
-    # and flip-flopping between paths mid-step would mix column namings.
-    use_grid = True
+    records: list[dict] = []
     sap_rows_total = 0
     for ci, chunk in enumerate(chunks):
         if stop.is_set():
@@ -1094,129 +796,62 @@ def _fetch_step(
 
         _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: loading {step.sap_table}{tag}")
         sap_ops.open_ztbv_table(sap, step.sap_table, log=lambda m: _log(on_event, m))
-        if push_id is None:
-            push_id = sap_ops.resolve_push_button(
-                sap, step.sap_table, step.push_button_field,
-                log=lambda m: _log(on_event, m))
         _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: sending {len(chunk)} filter values{tag}")
+        # The original notebook's transport: stage the keys in a scratch
+        # workbook, Copy(), upload from clipboard in the multi-select
+        # dialog (after clearing leftovers from a previous run).
+        scratch = excel_ops.stage_values_on_clipboard(xl.app, chunk)
         try:
-            # Item 3: primary transport is a temp text file ('Import from
-            # Text File' in the multi-select dialog) -- deterministic even
-            # if the user copies something to the clipboard mid-run.
-            sap_ops.fill_multi_value_filter_from_file(
-                sap, push_id, chunk, tmp_dir, log=lambda m: _log(on_event, m))
-        except sap_ops.SapError as e:
-            # Fallback: the Gen 2/3 clipboard path (values staged via an
-            # Excel scratch workbook). Kept for SAP GUI versions where the
-            # import dialog is not scriptable.
-            _log(on_event,
-                 f"file import unavailable ({e}); falling back to "
-                 f"clipboard paste", "warn")
-            scratch = excel_ops.stage_values_on_clipboard(xl.app, chunk)
-            try:
-                sap_ops.paste_multi_value_filter(
-                    sap, push_id, chunk, log=lambda m: _log(on_event, m))
-            finally:
-                excel_ops.close_scratch(scratch)
+            sap_ops.paste_multi_value_filter(
+                sap, push_id, chunk, log=lambda m: _log(on_event, m))
+        finally:
+            excel_ops.close_scratch(scratch)
         _status(on_event, f"[{step_index + 1}/{total_steps}] SAP: executing query{tag}")
         sap_ops.execute_query(sap, log=lambda m: _log(on_event, m))
 
-        # Item 2: read the status bar + confirm a result grid exists. An SAP
-        # error message or missing grid fails HERE with SAP's own words
-        # instead of a confusing export failure two calls later.
+        # Read the status bar + confirm a result grid exists: a bad query
+        # fails HERE with SAP's own words.
         grid_rows = sap_ops.query_result_check(sap, log=lambda m: _log(on_event, m))
         sap_rows_total += grid_rows
         if grid_rows == 0:
-            _log(on_event, f"SAP returned 0 rows{tag}; nothing to export", "warn")
+            _log(on_event, f"SAP returned 0 rows{tag}; nothing to read", "warn")
             sub_progress(2 + 4 * (ci + 1) / len(chunks))
             continue
 
-        # --- Primary read: the grid itself, by technical field name ------
-        # Ported from the original notebook. It sidesteps the export file
-        # format entirely and, because technical names are unique per field,
-        # every alias / duplicate-title / short-label problem with it.
-        if use_grid:
-            try:
-                _status(on_event,
-                        f"[{step_index + 1}/{total_steps}] SAP: reading ALV grid "
-                        f"({grid_rows} rows){tag}")
-                read_start = time.time()
-                records = sap_ops.read_alv_grid(
-                    sap, wanted_cols, log=lambda m: _log(on_event, m), stop=stop)
-                if stop.is_set():
-                    raise Cancelled()
-                df_chunk = pd.DataFrame(records, columns=wanted_cols)
-                _log(on_event,
-                     f"grid read finished in {time.time() - read_start:.1f}s "
-                     f"({len(df_chunk)} rows)")
-                if len(df_chunk) < grid_rows:
-                    raise RuntimeError(
-                        f"Grid read row-count mismatch{tag}: the status bar "
-                        f"reports {grid_rows} row(s) but only "
-                        f"{len(df_chunk)} were read.")
-                frames.append(df_chunk)
-                sub_progress(2 + 4 * (ci + 1) / len(chunks))
-                continue
-            except sap_ops.SapError as e:
-                # A missing technical name is the expected reason to land
-                # here; fall back to the export for the rest of the step.
-                _log(on_event,
-                     f"grid read unavailable ({e}); falling back to the file "
-                     f"export for this step", "warn")
-                use_grid = False
-
+        # Read the grid by technical field name -- the original notebook's
+        # method. Technical names are unique per field, so there is no
+        # column-title ambiguity, and no export file to parse.
         _status(on_event,
-                f"[{step_index + 1}/{total_steps}] SAP: exporting ALV grid "
+                f"[{step_index + 1}/{total_steps}] SAP: reading ALV grid "
                 f"({grid_rows} rows){tag}")
-        export_name = f"{step.sap_table}_{step.push_button_field}_{ts}_{ci}.xlsx"
-        export_start = time.time()
-        export_path = sap_ops.export_alv_to_file(
-            sap, tmp_dir, export_name, log=lambda m: _log(on_event, m)
-        )
-        try:
-            size_kb = os.path.getsize(export_path) / 1024.0
-        except OSError:
-            size_kb = 0.0
-        _log(on_event, f"export finished in {time.time() - export_start:.1f}s "
-                        f"({size_kb:.0f} KB)")
-
-        df_chunk = _read_sap_export(
-            export_path, log=lambda m: _log(on_event, m)
-        )
-        # Item 2: verify the file matches what the grid showed. Fewer rows
-        # than the grid = truncated export = silent data loss downstream.
-        if len(df_chunk) < grid_rows:
+        read_start = time.time()
+        chunk_records = sap_ops.read_alv_grid(
+            sap, wanted_cols, log=lambda m: _log(on_event, m), stop=stop)
+        if stop.is_set():
+            raise Cancelled()
+        _log(on_event,
+             f"grid read finished in {time.time() - read_start:.1f}s "
+             f"({len(chunk_records)} rows)")
+        if len(chunk_records) < grid_rows:
             raise RuntimeError(
-                f"Export row-count mismatch{tag}: the SAP grid shows "
-                f"{grid_rows} row(s) but the export file contains "
-                f"{len(df_chunk)} -- the export is incomplete. Re-run; if it "
-                f"persists, export once manually from ZTBV and compare with "
-                f"{export_path}.")
-        if len(df_chunk) > grid_rows:
-            _log(on_event,
-                 f"note: export has {len(df_chunk)} row(s) vs {grid_rows} in "
-                 f"the grid (totals/subtotal lines?); harmless unless the "
-                 f"extra rows carry key values", "warn")
-        frames.append(df_chunk)
+                f"Grid read row-count mismatch{tag}: the status bar reports "
+                f"{grid_rows} row(s) but only {len(chunk_records)} were "
+                f"read.")
+        records.extend(chunk_records)
         sub_progress(2 + 4 * (ci + 1) / len(chunks))
 
-    # --- 3. Combine chunk results, build lookup dict ---------------------
-    _status(on_event, f"[{step_index + 1}/{total_steps}] loading SAP export")
+    # --- 3. Build the lookup dict from the grid rows ---------------------
+    _status(on_event, f"[{step_index + 1}/{total_steps}] matching keys in memory")
     extra_sap_cols = [e.sap_col for e in step.extras if e.sap_col]
-    if not frames:
-        # Every chunk came back empty: a legitimate "no matches" outcome.
-        # (Previously this crashed in _build_lookup with a missing-columns
-        # error, because the export of an empty grid carries no data.)
+    if not records:
         _log(on_event,
              "SAP returned no rows for any of the requested keys -- every "
              "row will be treated as unmatched", "warn")
-        df = None
         lookup, dup_count, blank_key_count = {}, 0, 0
     else:
-        df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
-        _log(on_event, f"SAP returned {len(df)} row(s) with columns {list(df.columns)[:8]}{'...' if len(df.columns) > 8 else ''}")
+        _log(on_event, f"SAP returned {len(records)} row(s) with fields {wanted_cols}")
         lookup, dup_count, blank_key_count = _build_lookup(
-            df,
+            records,
             step.sap_key_columns,
             step.sap_output_columns + extra_sap_cols,
         )
@@ -1235,7 +870,6 @@ def _fetch_step(
     # Skip rows use the same else branch as SAP non-matches -- the notebook
     # write loop makes no distinction (both fall through to the same clear
     # branch). See _SKIP_KEY_MARKERS docstring.
-    _status(on_event, f"[{step_index + 1}/{total_steps}] matching keys in memory")
     matched = 0
     entries_by_row: list[dict | None] = []
     for k, skipped in zip(excel_keys, skip_flags):
@@ -1615,16 +1249,11 @@ def _dry_run_report(results: list[StepResult], on_event: EventFn) -> None:
 def _diagnose(workflow: str, sap: sap_ops.SapSession, on_event: EventFn) -> None:
     """Dump every ZTBV selection screen this workflow touches.
 
-    ZTBV's select-options are named generically (S3, S15, S29), so a filter
-    can only be identified by the label printed beside it. When that pairing
-    fails -- a screen built without GuiLabels, an unusual SAP GUI build --
-    the run dies with nothing to act on. This walks each table's screen and
-    logs BOTH the resolved filter list and the raw control inventory, so the
-    S<n> -> field mapping can be read by eye from the log file and pinned
-    with ESA_LOOKUP_PUSH_<TABLE>_<FIELD>.
-
-    Read-only: it navigates and reads. No filter is pasted, no query is
-    executed, and Excel is never opened.
+    ZTBV names its select-options generically (S3, S15, S29), so a filter
+    can only be identified by the texts printed on its row. This lists
+    every slot with those texts, and says whether each field the workflow
+    needs has a recorded slot in PUSH_BUTTONS. Read-only: no filter is
+    pasted, no query executed, Excel never opened.
     """
     tables: list[str] = []
     for step in WORKFLOWS[workflow]:
@@ -1632,63 +1261,37 @@ def _diagnose(workflow: str, sap: sap_ops.SapSession, on_event: EventFn) -> None
             tables.append(step.sap_table)
 
     _log(on_event,
-         f"DIAGNOSE: dumping the ZTBV selection screen for {len(tables)} "
-         f"table(s): {', '.join(tables)}. Nothing is pasted, executed, or "
-         f"written -- this only reads the screens.")
-
-    wanted_by_table: dict[str, list[str]] = {}
-    for step in WORKFLOWS[workflow]:
-        wanted_by_table.setdefault(step.sap_table, [])
-        if step.push_button_field not in wanted_by_table[step.sap_table]:
-            wanted_by_table[step.sap_table].append(step.push_button_field)
+         f"DIAGNOSE: listing filter slots for {len(tables)} table(s): "
+         f"{', '.join(tables)}. Nothing is pasted, executed, or written.")
 
     for table in tables:
         _log(on_event, "")
         _log(on_event, f"===== {table} =====")
         sap_ops.open_ztbv_table(sap, table, log=lambda m: _log(on_event, m))
         try:
-            filters = sap_ops.describe_selection_screen(sap)
+            sap_ops.list_filter_slots(sap, log=lambda m: _log(on_event, m))
         except sap_ops.SapError as e:
-            _log(on_event, f"{table}: cannot read the selection screen: {e}",
-                 "error")
+            _log(on_event, f"{table}: {e}", "error")
             continue
-
-        _log(on_event, f"{table}: {len(filters)} multi-value filter(s)")
-        for f in filters:
-            _log(on_event,
-                 f"  {f['param']:<6} row={f['row']:<4} label={f['label']!r}"
-                 + (f"  tooltip={f['tooltip']!r}" if f["tooltip"] else ""))
-
-        # What this workflow actually needs off this screen, and whether it
-        # would resolve right now.
-        for field in wanted_by_table[table]:
-            try:
-                pid = sap_ops.resolve_push_button(sap, table, field)
-                _log(on_event, f"  -> {field} resolves to {pid}", "ok")
-            except sap_ops.SapError as e:
-                _log(on_event, f"  -> {field} DOES NOT RESOLVE: {e}", "error")
+        for step in WORKFLOWS[workflow]:
+            if step.sap_table != table:
+                continue
+            key = (table, step.push_button_field)
+            slot = sap_ops.PUSH_BUTTONS.get(key)
+            if slot:
                 _log(on_event,
-                     f"     pin it with: set "
-                     f"{sap_ops.env_override_var(table, field)}=S<n>", "warn")
-
-        # Raw inventory -- the fallback when no label paired. Only text-bearing
-        # controls; the rest is noise for this purpose.
-        _file_log("info", f"--- {table}: raw control inventory ---")
-        try:
-            for it in sap_ops.screen_inventory(sap):
-                if not (it["text"] or it["tooltip"]):
-                    continue
-                _file_log("info",
-                          f"  {it['type']:<16} row={it['row']:<4} "
-                          f"col={it['col']:<4} name={it['name']!r} "
-                          f"text={it['text']!r} tooltip={it['tooltip']!r}")
-        except sap_ops.SapError as e:
-            _file_log("info", f"  inventory unavailable: {e}")
+                     f"  -> {step.push_button_field} uses recorded slot "
+                     f"{slot}", "ok")
+            else:
+                _log(on_event,
+                     f"  -> {step.push_button_field} has NO recorded slot "
+                     f"-- pick it from the list above and add it to "
+                     f"PUSH_BUTTONS (SAP utilities)", "error")
 
     _log(on_event, "")
     _log(on_event,
-         "DIAGNOSE complete. The full per-control dump is in the log FILE "
-         "(path echoed at the top) -- send that file on.", "ok")
+         "DIAGNOSE complete -- compare the slots above with PUSH_BUTTONS "
+         "and send the log file when reporting.", "ok")
 
 
 @dataclass
@@ -1775,16 +1378,9 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"esa-lookup starting workflow '{cfg.workflow}'", "info")
         if log_path:
             _log(on_event, f"detailed log file: {log_path}", "info")
-        # Diagnostic: freeze the environment into the file so a post-mortem
-        # can tell which Python / pandas / openpyxl the run used.
-        try:
-            import openpyxl as _openpyxl
-            openpyxl_v = _openpyxl.__version__
-        except Exception:
-            openpyxl_v = "?"
+        # Diagnostic: freeze the environment into the file for post-mortems.
         _file_log("info",
-                  f"env: Python {sys.version.split()[0]} on "
-                  f"{sys.platform}, pandas {pd.__version__}, openpyxl {openpyxl_v}, "
+                  f"env: Python {sys.version.split()[0]} on {sys.platform}, "
                   f"cwd={os.getcwd()}, excel={cfg.excel_path}")
 
         # Diagnose is SAP-only and read-only: no workbook is opened, so it
@@ -1814,7 +1410,6 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
 
         steps = WORKFLOWS[cfg.workflow]
         total_steps = len(steps)
-        tmp_dir = os.path.join(tempfile.gettempdir(), "esa_lookup")
         vsheet = VirtualSheet(xl.sheet)
 
         # ---- Phase 0: template-formula derivations (sheet -> sheet) -----
@@ -1884,7 +1479,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
                 raise Cancelled()
             step_label = f"Step {i + 1} of {total_steps} ({step.sap_table})"
             res = _fetch_step(
-                step, vsheet, xl, sap, tmp_dir, on_event, i, total_steps,
+                step, vsheet, xl, sap, on_event, i, total_steps,
                 cfg.stop_event, step_popups=cfg.step_popups,
             )
             if res is None:

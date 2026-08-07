@@ -43,11 +43,13 @@ class TestToWorkflow:
         assert first_mutation > last_export
         assert env.events[-1] == ("write", "SAVE")
 
-    def test_happy_path_never_touches_clipboard(self, env):
+    def test_happy_path_stages_clipboard_once_per_step(self, env):
         env.grid = make_to_grid()
         ok, _ = env.run("TO")
         assert ok
-        assert env.clipboard_stages == 0
+        # the original notebook's transport, and now the only one:
+        # scratch workbook -> clipboard -> upload, once per step
+        assert env.clipboard_stages == 3
 
 
 class TestNotifWorkflow:
@@ -183,17 +185,6 @@ class TestSapSelfChecks:
         assert env.grid.get((2, 3)) == "STALE1"
         assert "returned 0 rows" in logs
         assert "no rows for any" in logs
-
-
-class TestFilterTransport:
-    def test_clipboard_fallback(self, env):
-        env.grid = make_to_grid()
-        env.file_import_fails = True
-        ok, logs = env.run("TO")
-        assert ok, logs
-        env.assert_cells(EXPECTED_TO)
-        assert env.clipboard_stages == 3        # one per step
-        assert "falling back to clipboard paste" in logs
 
 
 class TestDryRun:

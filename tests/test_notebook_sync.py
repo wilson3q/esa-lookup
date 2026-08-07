@@ -53,21 +53,27 @@ class TestNotebookCarriesTheCode:
     'two large dicts differ'."""
 
     @pytest.mark.parametrize("needle", [
-        "def describe_selection_screen(",
-        "def screen_inventory(",
         "def resolve_push_button(",
         "def push_button_id(",
+        "def list_filter_slots(",
         "def _salvage_completed_steps(",
         "def _diagnose(",
         "def screen_snapshot(",
-        "CharTop",                      # the label-pairing fix
-        "ESA_LOOKUP_PUSH_",             # the no-rebuild filter override
+        "def _build_lookup(",
+        "PUSH_BUTTONS = {",
     ])
     def test_source_is_inlined(self, committed, needle):
         assert any(needle in s for s in _cell_sources(committed)), needle
 
-    def test_old_pixel_pairing_is_gone(self, committed):
-        assert not any("labels_by_top" in s for s in _cell_sources(committed))
+    def test_removed_machinery_stays_removed(self, committed):
+        """The export fallback, label resolution, and file transport were
+        deleted so the operator can read the utilities. If any of these
+        names reappear, the bloat is creeping back."""
+        for needle in ("import pandas", "describe_selection_screen",
+                       "export_alv_to_file", "_read_sap_export",
+                       "SAP_COLUMN_ALIASES",
+                       "fill_multi_value_filter_from_file"):
+            assert not any(needle in s for s in _cell_sources(committed)), needle
 
     def test_process_cells_carry_the_operator_interface(self, committed):
         """The ESA operator thinks in processes, not in framework parts:

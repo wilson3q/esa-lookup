@@ -4,10 +4,9 @@ The original addressed SAP columns by TECHNICAL name via GetCellValue, which
 is why it never needed an alias table: 'TANUM' is 'TANUM' whatever the
 layout titles it. The export-based port had to guess titles, which produced
 the 'Unl. Point' miss, the triplicate-'Item' ambiguity and the RSPOS
-mis-binding. These tests pin the grid read as the primary path and the
-export as the fallback.
+mis-binding. These tests pin the grid read as THE read path (the export
+fallback was removed along with its pandas dependency).
 """
-import pandas as pd
 import pytest
 
 from conftest import EXPECTED_TO, make_to_grid
@@ -51,40 +50,6 @@ class TestGridIsPrimary:
         assert all(len(cols) <= 7 for cols in asked), asked
 
 
-class TestExportFallback:
-    def test_falls_back_when_grid_unavailable(self, env):
-        env.no_grid_tables.add("LTAP")
-        env.grid = make_to_grid()
-        ok, logs = env.run("TO")
-        assert ok
-        assert "falling back to the file export" in logs
-        kinds = [k for k, _ in env.events]
-        assert "export" in kinds          # LTAP took the file path
-        assert "gridread" in kinds        # later steps still used the grid
-
-    def test_fallback_produces_the_same_values(self, env):
-        env.no_grid_tables.update(
-            {"LTAP", "Z50CFG_ENG_CRNT", "Z50CFG_ENG_VALD"})
-        env.grid = make_to_grid()
-        ok, _ = env.run("TO")
-        assert ok
-        assert [k for k, _ in env.events].count("export") == 3
-        # The export path reads everything as str (dtype=str keeps leading
-        # zeros); the grid path returns SAP's native types. Both land in
-        # text-formatted cells, so compare values stringified.
-        for k, v in EXPECTED_TO.items():
-            assert str(env.grid.get(k)) == str(v), (k, env.grid.get(k), v)
-
-    def test_missing_technical_name_falls_back_rather_than_failing(self, env):
-        """A field absent from the displayed variant must not kill the run."""
-        env.sap_tables["LTAP"] = pd.DataFrame({
-            "TANUM": ["T001", "T002"], "ABLAD": ["00000001000001", "00000002000002"]})
-        env.no_grid_tables.add("LTAP")
-        env.grid = make_to_grid()
-        ok, _ = env.run("TO")
-        assert ok
-
-
 class TestRowCountGuard:
     def test_short_grid_read_aborts_before_any_write(self, env):
         env.grid = make_to_grid()
@@ -100,3 +65,15 @@ class TestRowCountGuard:
                            (2, 14): "100", (3, 14): "200",
                            (2, 15): "1", (3, 15): "2"}, (
             "only the completed step's columns may change on abort")
+
+
+class TestGridIsTheOnlyPath:
+    def test_grid_failure_is_a_clear_error_not_a_silent_switch(self, env):
+        """The export-file fallback is gone (it existed for a case that
+        never occurs on the ESA system). A grid problem must fail loudly
+        with SAP's message, not silently change read methods."""
+        env.grid = make_to_grid()
+        env.sap_tables["LTAP"] = [{"TANUM": "T001"}]   # ABLAD missing
+        ok, logs = env.run("TO")
+        assert not ok
+        assert "no column 'ABLAD'" in logs

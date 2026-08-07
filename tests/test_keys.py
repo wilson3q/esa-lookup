@@ -1,5 +1,4 @@
 """Unit tests for the pure key-normalization / helper functions."""
-import pandas as pd
 import pytest
 
 import pipeline
@@ -83,39 +82,29 @@ class TestCleanCell:
 
 
 class TestBuildLookup:
-    def test_alias_resolution(self):
-        # ALV export used display titles, not technical names
-        df = pd.DataFrame({
-            "Reservation": [100], "Item": [1], "Object Number": ["OBJ1"]})
-        lookup, dups, blanks = _build_lookup(
-            df, ["RSNUM", "RSPOS"], ["OBJNR"])
+    def test_records_by_technical_name(self):
+        rows = [{"RSNUM": 100, "RSPOS": 1, "OBJNR": "OBJ1"}]
+        lookup, dups, blanks = _build_lookup(rows, ["RSNUM", "RSPOS"], ["OBJNR"])
         assert lookup == {"100|1": {"OBJNR": "OBJ1"}}
         assert dups == 0 and blanks == 0
 
     def test_duplicate_keeps_first(self):
-        df = pd.DataFrame({"TANUM": ["T1", "T1"], "ABLAD": ["A", "B"]})
-        lookup, dups, _ = _build_lookup(df, ["TANUM"], ["ABLAD"])
+        rows = [{"TANUM": "T1", "ABLAD": "A"}, {"TANUM": "T1", "ABLAD": "B"}]
+        lookup, dups, _ = _build_lookup(rows, ["TANUM"], ["ABLAD"])
         assert lookup["T1"]["ABLAD"] == "A"   # Fix C: first wins
         assert dups == 1
 
     def test_partial_blank_key_skipped(self):
-        # Fix D: "12345|" must not become a match-all key
-        df = pd.DataFrame({
-            "RSNUM": [100, 200], "RSPOS": [1, None], "OBJNR": ["O1", "O2"]})
-        lookup, _, blanks = _build_lookup(df, ["RSNUM", "RSPOS"], ["OBJNR"])
-        assert "200|" not in lookup
+        rows = [{"RSNUM": 100, "RSPOS": "", "OBJNR": "X"},
+                {"RSNUM": 200, "RSPOS": 2, "OBJNR": "Y"}]
+        lookup, _, blanks = _build_lookup(rows, ["RSNUM", "RSPOS"], ["OBJNR"])
+        assert list(lookup) == ["200|2"]      # Fix D: "100|" never matches
         assert blanks == 1
 
-    def test_missing_column_raises_with_hint(self):
-        df = pd.DataFrame({"SOMETHING": [1]})
-        with pytest.raises(RuntimeError, match="missing these expected columns"):
-            _build_lookup(df, ["TANUM"], ["ABLAD"])
-
-    def test_nan_value_becomes_empty(self):
-        df = pd.DataFrame({"TANUM": ["T1"], "ABLAD": [float("nan")]})
-        lookup, _, _ = _build_lookup(df, ["TANUM"], ["ABLAD"])
+    def test_none_value_becomes_empty(self):
+        rows = [{"TANUM": "T1", "ABLAD": None}]
+        lookup, _, _ = _build_lookup(rows, ["TANUM"], ["ABLAD"])
         assert lookup["T1"]["ABLAD"] == ""
-
 
 class TestUnloadingPointSplit:
     """The template formulas, pinned as executable truth (operator-supplied

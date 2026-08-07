@@ -26,12 +26,10 @@ fetched, not off column C in the sheet); the workbook is then written
   query+export rounds automatically. The multi-select dialog is also
   cleared before each paste, so values left over from a previous run can
   no longer leak into the filter.
-- Filter values now reach SAP through a **temp text file** ('Import from
-  Text File' in the multi-select dialog) instead of the OS clipboard --
-  copying something to the clipboard while a run is in flight can no
-  longer corrupt the filter. If the import dialog is not scriptable on a
-  given SAP GUI version, the app logs a warning and automatically falls
-  back to the old clipboard paste.
+- Filter values reach SAP the way the original notebook sent them: staged
+  in a scratch workbook, copied, and uploaded from the clipboard -- with
+  the multi-select dialog cleared of leftovers first. Avoid copying
+  things to the clipboard while a run is in flight.
 - **Dry run mode** (checkbox in the GUI, `DRY_RUN = True` in the
   notebook): runs every SAP lookup and reports match counts + sample rows
   in the log, but leaves the workbook completely untouched. Use it to
@@ -162,41 +160,12 @@ exported file.
   Check Options -> Accessibility & Scripting.
 - **"Cannot attach to Excel"** - open the target .xlsx in Excel first, or
   let the app open it (blank/read-only files trip OneDrive).
-- **Export dialog IDs don't match** - the exact `wnd[1]` field names for
-  the Save-As dialog vary slightly between SAP GUI versions. Record a
-  single export via SAP GUI Script Recorder and adjust `EXPORT_SEQUENCES`
-  in `sap_ops.py`.
-- **"file import unavailable ... falling back to clipboard paste"** - the
-  multi-select dialog's Import-from-Text-File path could not be scripted
-  (older SAP GUI, or 'Show native Microsoft Windows dialogs' is On). The
-  run still works via the clipboard; to fix the import path, check that
-  native dialogs are Off, or record the import once with the Script
-  Recorder and adjust `fill_multi_value_filter_from_file` in `sap_ops.py`.
-- **"Could not resolve the `<FIELD>` filter on `<TABLE>`"** - ZTBV names its
-  select-options generically (`S3`, `S15`, `S29`), so a filter that is not
-  already recorded in `PUSH_BUTTONS` has to be identified by the label
-  printed beside it on the selection screen. This error means zero or
-  several labels matched, and the app refuses to guess -- pasting keys into
-  the wrong filter returns confidently wrong data, which is worse than
-  stopping. To fix it:
-  1. Click **Diagnose**. It lists every `S<n>` on that screen with its
-     label and tooltip, and dumps a full per-control inventory to the log
-     file. Read off which `S<n>` is the field you need.
-  2. Pin it **without a rebuild** by setting an environment variable, then
-     re-run:
-     ```powershell
-     $env:ESA_LOOKUP_PUSH_Z50CFG_ENG_CRNT_TO_NUMBER = "S7"
-     ```
-     The name is `ESA_LOOKUP_PUSH_<TABLE>_<FIELD>`, uppercased, with any
-     non-alphanumeric character replaced by `_`. The value is the bare
-     `S<n>` (or a full control id).
-  3. To make it permanent, add it to `PUSH_BUTTONS` in `sap_ops.py`:
-     ```python
-     ("Z50CFG_ENG_CRNT", "TO_NUMBER"): push_button_id("S7"),
-     ```
-  If every label in the Diagnose output reads `(no label found)`, send the
-  log **file** -- it carries the raw control dump with the coordinates and
-  tooltips needed to work out the mapping.
+- **"No filter slot recorded for `<FIELD>` on `<TABLE>`"** - ZTBV names
+  its select-options generically (`S3`, `S15`, ...), and the app uses the
+  slots recorded in `PUSH_BUTTONS` (in `sap_ops.py` / the SAP utilities
+  cell). If SAP's screen changed, run **Diagnose**: it lists every slot
+  with the texts on its row; pick the right one and edit the
+  `PUSH_BUTTONS` entry.
 - **Fewer matches than expected** - your ALV layout is probably missing a
   key column; edit and re-save the layout, then re-run.
 - **"WARNING: sent N unique key(s) to SAP but only M matched"** - shown
@@ -405,25 +374,13 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Covered: key normalization + lookup building (`tests/test_keys.py`), the
-Gen 4 in-memory column resolver (`tests/test_virtual_sheet.py`), reading
-the `S<n>` -> field mapping off the selection screen
-(`tests/test_selection_screen.py`), and both workflows end-to-end against a
-fake SAP/Excel -- including partial-write-on-failure, chunking, 0-row
-results, truncated exports, the clipboard fallback, and dry run
-(`tests/test_workflow_e2e.py`).
-
-Two notes for anyone extending these, both learned the hard way:
-
-- `tests/conftest.py` monkeypatches `sap_ops.resolve_push_button`, so the
-  end-to-end tests do **not** exercise filter resolution. That path is
-  covered only by `tests/test_selection_screen.py`.
-- The fakes in `test_selection_screen.py` carry both coordinate systems
-  (`CharTop`/`CharLeft` and `Top`/`Left`), with each label's pixel `Top`
-  deliberately offset from the button beside it. An earlier fake gave them
-  identical `Top` values, which made a broken pairing look correct -- the
-  suite stayed green while every filter on the customer's screen came back
-  `(no label found)`.
+Covered: key normalization, the template-formula splits, and lookup
+building (`tests/test_keys.py`), the Gen 4 in-memory column resolver
+(`tests/test_virtual_sheet.py`), the grid read (`tests/test_grid_read.py`),
+popups and step-by-step mode (`tests/test_popups.py`), notebook/source
+sync (`tests/test_notebook_sync.py`), and both workflows end-to-end
+against a fake SAP/Excel (`tests/test_workflow_e2e.py`,
+`tests/test_mixed_rows.py`).
 
 ## Files
 

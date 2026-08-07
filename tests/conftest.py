@@ -39,7 +39,6 @@ def _stub_com_modules() -> None:
 _stub_com_modules()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
 import excel_ops  # noqa: E402
@@ -97,19 +96,25 @@ def parse_range(rng: str):
 # Reference SAP data used by the fakes (fresh copy per FakeEnv)
 # ---------------------------------------------------------------------------
 
-def default_sap_tables() -> dict[str, pd.DataFrame]:
+def _rows(cols: dict) -> list[dict]:
+    """Column dict -> list of row dicts (what read_alv_grid returns)."""
+    n = len(next(iter(cols.values())))
+    return [{k: v[i] for k, v in cols.items()} for i in range(n)]
+
+
+def default_sap_tables() -> dict[str, list[dict]]:
     return {
-        "LTAP": pd.DataFrame({
+        "LTAP": _rows({
             # ESA-encoded unloading points: 10-digit reservation + 4-digit
             # item. Splitting gives 100|1 and 200|2 -- the keys CRNT holds.
             "TANUM": ["T001", "T002"],
             "ABLAD": ["00000001000001", "00000002000002"]}),
-        "Z50CFG_ENG_CRNT": pd.DataFrame({
+        "Z50CFG_ENG_CRNT": _rows({
             "TANUM": ["T001", "T002"],
             "QMNUM": ["QN1", "QN2"], "RSNUM": [100, 200], "RSPOS": [1, 2],
             "OBJNR": ["OBJ1", "OBJ2"], "DISP_MATNR": ["MAT1", "MAT2"],
             "DISP_QTY": [5, 7]}),
-        "Z50CFG_ENG_VALD": pd.DataFrame({
+        "Z50CFG_ENG_VALD": _rows({
             "OBJNR": ["OBJ1", "OBJ2"], "Z_SECTION": ["S1", "S2"],
             "Z_MODULE": ["M1", "M2"], "DESCRIPT": ["D1", "D2"],
             "SALES_ORDER": ["SO1", "SO2"], "LID": ["L1", "L2"]}),
@@ -177,8 +182,6 @@ class FakeEnv:
         self.fail_table: str | None = None       # query_result_check raises
         self.zero_tables: set = set()            # query returns 0 rows
         self.truncate_tables: set = set()        # grid claims more than export
-        self.no_grid_tables: set = set()         # force the export fallback
-        self.file_import_fails = False           # simulate unscriptable dialog
         self.clipboard_stages = 0
         self.sheet = FakeSheet(self)
         self._install(monkeypatch)
@@ -220,11 +223,6 @@ class FakeEnv:
         def open_table(s, table, log=None):
             env.current_table = table
 
-        def fill_from_file(s, pid, values, work_dir, log=None):
-            if env.file_import_fails:
-                raise sap_ops.SapError("simulated: import dialog not scriptable")
-            env.events.append(("paste", list(values)))
-
         def paste_clipboard(s, pid, values, log=None):
             env.events.append(("paste", list(values)))
 
@@ -238,27 +236,18 @@ class FakeEnv:
             return n + 5 if t in env.truncate_tables else n
 
         def read_grid(sap, columns, log=None, stop=None):
-            """Primary path: the ALV grid, addressed by technical name."""
+            """The ALV grid, addressed by technical field name."""
             table = env.current_table
-            if table in env.no_grid_tables:
-                raise sap_ops.SapError("simulated: grid read unavailable")
-            df = env.sap_tables[table]
-            missing = [c for c in columns if c not in df.columns]
-            if missing:
-                raise sap_ops.SapError(
-                    f"ALV grid has no column {missing[0]!r} (technical name)")
+            rows = env.sap_tables[table]
+            if rows:
+                missing = [c for c in columns if c not in rows[0]]
+                if missing:
+                    raise sap_ops.SapError(
+                        f"ALV grid has no column {missing[0]!r} "
+                        f"(technical name)")
             env.events.append(("fetch", table))
             env.events.append(("gridread", table))
-            return df[list(columns)].to_dict("records")
-
-        def export(sap, target_dir, filename, log=None, timeout_s=30):
-            table = env.current_table
-            env.events.append(("fetch", table))
-            env.events.append(("export", table))
-            os.makedirs(target_dir, exist_ok=True)
-            path = os.path.join(target_dir, filename)
-            env.sap_tables[table].to_excel(path, index=False)
-            return path
+            return [{c: r[c] for c in columns} for r in rows]
 
         mp.setattr(excel_ops, "last_row_in_column", last_row)
         mp.setattr(excel_ops, "read_range_2d", read)
@@ -274,14 +263,12 @@ class FakeEnv:
                    lambda p: excel_ops.ExcelCtx(app=None, book=None, sheet=env.sheet))
         mp.setattr(sap_ops, "attach", lambda: sap_ops.SapSession(None))
         mp.setattr(sap_ops, "open_ztbv_table", open_table)
-        mp.setattr(sap_ops, "fill_multi_value_filter_from_file", fill_from_file)
         mp.setattr(sap_ops, "paste_multi_value_filter", paste_clipboard)
         mp.setattr(sap_ops, "execute_query", lambda s, log=None: None)
         mp.setattr(sap_ops, "query_result_check", check)
         mp.setattr(sap_ops, "read_alv_grid", read_grid)
         mp.setattr(sap_ops, "resolve_push_button",
                    lambda s, table, field, log=None: f"btn_{table}_{field}")
-        mp.setattr(sap_ops, "export_alv_to_file", export)
 
     # -- helpers -----------------------------------------------------------
     def run(self, workflow="TO", dry_run=False, stop_event=None,
