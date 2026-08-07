@@ -16,12 +16,13 @@ def _mixed_grid():
     g = {}
     for c in range(1, 17):
         g[(1, c)] = f"H{c}"
-    # rows 2, 3: full TO rows (K + N + O)
-    g[(2, 11)], g[(2, 14)], g[(2, 15)] = "T001", 100, 1
-    g[(3, 11)], g[(3, 14)], g[(3, 15)] = "T002", 200, 2
-    # row 4: TO number but no reservation pair -- step 1 serves it, step 2
-    # must skip it (incomplete composite key)
-    g[(4, 11)] = "T001"
+    # rows 2, 3: TO rows. N/O start EMPTY -- the pipeline derives them
+    # from the unloading point (the template formula's old job).
+    g[(2, 11)] = "T001"
+    g[(3, 11)] = "T002"
+    # row 4: TO number that will not match LTAP -- no unloading point, so
+    # no reservation pair can be derived and step 2 must skip the row
+    g[(4, 11)] = "T404"
     # row 5: notification-only row -- A filled, everything else empty
     g[(5, 1)] = "000429215427"
     return g
@@ -37,10 +38,10 @@ class TestMixedKeyRows:
         env.grid = _mixed_grid()
         ok, _ = env.run("TO")
         assert ok
-        assert env.grid[(2, 13)] == "DockA"    # M: step 1
+        assert env.grid[(2, 13)] == "00000001000001"   # M: step 1
         assert env.grid[(2, 3)] == "OBJ1"      # C: step 2 (RSNUM|RSPOS)
         assert env.grid[(2, 6)] == "S1"        # F: step 3 keyed off C
-        assert env.grid[(3, 13)] == "DockB"
+        assert env.grid[(3, 13)] == "00000002000002"
         assert env.grid[(3, 3)] == "OBJ2"
 
     def test_notification_only_row_keeps_its_A(self, env):
@@ -54,13 +55,23 @@ class TestMixedKeyRows:
         assert env.grid.get((5, 3)) in ("", None)
         assert env.grid.get((5, 13)) in ("", None)
 
-    def test_partial_reservation_pair_is_skipped_not_fatal(self, env):
+    def test_derived_pair_lands_in_the_sheet(self, env):
+        """The template formula's job, now the pipeline's: N/O split out
+        of the unloading point, visible in the sheet for auditing."""
+        env.grid = _mixed_grid()
+        ok, _ = env.run("TO")
+        assert ok
+        assert env.grid[(2, 14)] == "100" and env.grid[(2, 15)] == "1"
+        assert env.grid[(3, 14)] == "200" and env.grid[(3, 15)] == "2"
+
+    def test_row_without_unloading_point_is_skipped_not_fatal(self, env):
         env.grid = _mixed_grid()
         ok, logs = env.run("TO")
         assert ok
-        # row 4: M filled by step 1 (K present)...
-        assert env.grid[(4, 13)] == "DockA"
-        # ...but step 2 skipped it (no reservation pair), so no OBJNR
+        # row 4: no LTAP match -> no unloading point -> no derived pair ->
+        # step 2 skips the row; nothing invented
+        assert env.grid.get((4, 13)) in ("", None)
+        assert env.grid.get((4, 14)) in ("", None)
         assert env.grid.get((4, 3)) in ("", None)
 
     def test_blanks_never_reach_the_sap_filter(self, env):

@@ -126,7 +126,10 @@ class TestReadSapExport:
             p, index=False)
         df = _read_sap_export(str(p))
         assert list(df.columns) == ["TANUM", "ABLAD"]
-        assert df.iloc[0]["TANUM"] == 1785822
+        # dtype=str on purpose: numeric inference would eat the leading
+        # zeros of encoded values like the ESA unloading point. Key
+        # matching normalizes both sides, so strings match fine.
+        assert df.iloc[0]["TANUM"] == "1785822"
 
     def test_logs_when_falling_back_to_text(self, tmp_path):
         p = tmp_path / "export.xlsx"

@@ -84,7 +84,7 @@ class TestFailureAtomicity:
 
         # steps 1 and 2 completed -> their columns are written
         env.assert_cells({
-            (2, 13): "DockA", (3, 13): "DockB",         # M   (step 1)
+            (2, 13): "00000001000001", (3, 13): "00000002000002",   # M (step 1)
             (2, 3): "OBJ1", (3, 3): "OBJ2",             # C   (step 2)
             (2, 4): "MAT1", (2, 5): 5,                  # D,E (step 2)
             (2, 1): "QN1", (3, 1): "QN2",               # A   (step 2 extra)
@@ -105,9 +105,11 @@ class TestFailureAtomicity:
         ok, logs = env.run("TO")
         assert not ok
         assert "row-count mismatch" in logs
-        # exactly step 1's column M changed; nothing else moved
+        # exactly step 1's outputs changed: M plus the derived N/O pair
         changed = {k: v for k, v in env.grid.items() if seed.get(k) != v}
-        assert changed == {(2, 13): "DockA", (3, 13): "DockB"}
+        assert changed == {(2, 13): "00000001000001", (3, 13): "00000002000002",
+                           (2, 14): "100", (3, 14): "200",
+                           (2, 15): "1", (3, 15): "2"}
         # step 2's own key column keeps the sentinel garbage it started with
         assert env.grid[(2, 3)] == "STALE1"
 
@@ -165,12 +167,20 @@ class TestSapSelfChecks:
         assert "2 chunk(s) of <= 1" in logs
 
     def test_zero_row_result_is_clean_unmatched(self, env):
+        """LTAP returns nothing -> no unloading points -> no reservation
+        pair can be derived -> steps 2 and 3 skip themselves (exactly the
+        original notebook, whose step 2 exited on 'No valid Number of
+        Reservation'). The run still succeeds and step 1's clears land."""
         env.grid = make_to_grid()
         env.zero_tables.add("LTAP")
         ok, logs = env.run("TO")
         assert ok, logs
         assert env.grid.get((2, 13)) == "" and env.grid.get((3, 13)) == ""
-        assert env.grid.get((2, 3)) == "OBJ1"   # later steps still ran
+        assert env.grid.get((2, 14)) == "" and env.grid.get((2, 15)) == ""
+        # the derived key column is empty, so step 2 skips itself
+        assert "No data below the header in column N" in logs
+        # step 2 never wrote, so C keeps whatever it held (his behavior too)
+        assert env.grid.get((2, 3)) == "STALE1"
         assert "returned 0 rows" in logs
         assert "no rows for any" in logs
 

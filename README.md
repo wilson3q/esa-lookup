@@ -128,8 +128,8 @@ notification results (each pass clears its output columns before refilling).
 
 | # | Read from | SAP table         | SAP filter field   | Writes to Excel columns |
 |---|-----------|-------------------|--------------------|--------------------------|
-| 1 | Col K     | `LTAP`            | TO Number          | `ABLAD` -> M             |
-| 2 | Col N + O | `Z50CFG_ENG_CRNT` | Reservation Number | `QMNUM` -> A (matched rows only), `OBJNR` -> C, `DISP_MATNR` -> D, `DISP_QTY` -> E, match key -> P |
+| 1 | Col K     | `LTAP`            | TO Number          | `ABLAD` -> M, reservation pair split out of `ABLAD` -> N + O |
+| 2 | Col N + O (derived by step 1) | `Z50CFG_ENG_CRNT` | Reservation Number | `QMNUM` -> A (matched rows only), `OBJNR` -> C, `DISP_MATNR` -> D, `DISP_QTY` -> E, match key -> P |
 | 3 | Col C     | `Z50CFG_ENG_VALD` | Object Number      | `Z_SECTION`/`Z_MODULE`/`DESCRIPT`/`SALES_ORDER` -> F..I (J cleared on non-match) |
 
 ### Notification Number process (2 steps)
@@ -445,3 +445,16 @@ Two things the builder cannot do for you: all three modules are flattened
 into one namespace, so a **new top-level name that collides** across modules
 will silently shadow; and `attach`/`save` are renamed by an explicit map in
 `build_notebook.py`, so **renaming those** needs the map updated too.
+
+## The unloading point encodes the reservation pair
+
+The ESA `ABLAD` value is `10-digit reservation number + 4-digit item`
+(`05175455500001` -> N `517545550`, O `1`). The Excel template used to
+split it with a FORMULA in columns N/O. The app cannot rely on that
+formula: writes are deferred to the end of the run (step 2 would read N/O
+before M exists in the sheet), and formulas are easily lost when sheets
+are copied. The split is done in `pipeline.py`
+(`_reservation_from_unloading_point` / `_item_from_unloading_point`) and
+the derived values are written to N/O for auditing. Anything that does not
+look like the encoded form yields blank -- and the row is skipped by step
+2 as having no reservation.

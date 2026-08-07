@@ -100,7 +100,10 @@ def parse_range(rng: str):
 def default_sap_tables() -> dict[str, pd.DataFrame]:
     return {
         "LTAP": pd.DataFrame({
-            "TANUM": ["T001", "T002"], "ABLAD": ["DockA", "DockB"]}),
+            # ESA-encoded unloading points: 10-digit reservation + 4-digit
+            # item. Splitting gives 100|1 and 200|2 -- the keys CRNT holds.
+            "TANUM": ["T001", "T002"],
+            "ABLAD": ["00000001000001", "00000002000002"]}),
         "Z50CFG_ENG_CRNT": pd.DataFrame({
             "TANUM": ["T001", "T002"],
             "QMNUM": ["QN1", "QN2"], "RSNUM": [100, 200], "RSPOS": [1, 2],
@@ -120,8 +123,8 @@ def make_to_grid() -> dict:
     for c in range(1, 17):
         g[(1, c)] = f"H{c}"                      # headers
     g[(2, 11)], g[(3, 11)] = "T001", "T002"      # K: TO numbers
-    g[(2, 14)], g[(3, 14)] = 100, 200            # N: reservation
-    g[(2, 15)], g[(3, 15)] = 1, 2                # O: item
+    g[(2, 14)], g[(3, 14)] = "STALE-N", "STALE-N"  # N: derived by step 1
+    g[(2, 15)], g[(3, 15)] = "STALE-O", "STALE-O"  # O: derived by step 1
     g[(2, 3)], g[(3, 3)] = "STALE1", "STALE2"    # C: sentinel garbage
     g[(2, 1)], g[(3, 1)] = "keepA2", "keepA3"    # A: pre-existing
     g[(2, 10)], g[(3, 10)] = "keepJ2", "keepJ3"  # J: pre-existing
@@ -139,10 +142,10 @@ def make_notif_grid() -> dict:
 
 
 EXPECTED_TO = {
-    (2, 13): "DockA", (3, 13): "DockB",            # M
+    (2, 13): "00000001000001", (3, 13): "00000002000002",  # M: ABLAD
     (2, 1): "QN1", (3, 1): "QN2",                  # A: QMNUM derived on match
-    (2, 14): 100, (3, 14): 200,                    # N: input, untouched
-    (2, 15): 1, (3, 15): 2,                        # O: input, untouched
+    (2, 14): "100", (3, 14): "200",                # N: split out of ABLAD
+    (2, 15): "1", (3, 15): "2",                    # O: split out of ABLAD
     (2, 3): "OBJ1", (3, 3): "OBJ2",                # C from step 2
     (2, 4): "MAT1", (2, 5): 5,                     # D, E
     (2, 6): "S1", (2, 7): "M1", (2, 8): "D1", (2, 9): "SO1",  # F..I

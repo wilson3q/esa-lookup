@@ -161,6 +161,11 @@ class ExtraOutput:
     excel_col: int
     sap_col: str | None = None
     preserve_on_nonmatch: bool = False
+    # Optional per-value transform applied to the fetched SAP value before
+    # writing (and before publishing for downstream steps). Used to derive
+    # the reservation pair out of the unloading point -- the job the Excel
+    # template used to do with a formula.
+    transform: Callable[[str], str] | None = None
 
 
 @dataclass
@@ -181,6 +186,31 @@ class LookupStep:
     match_key_header: str = "Excel Match Key Used"
 
 
+# The ESA unloading point (LTAP ABLAD) encodes the reservation pair:
+# 10-digit zero-padded reservation number + 4-digit item. Example from the
+# live workbook: ABLAD '05175455500001' -> N 517545550, O 1;
+# '05175456020012' -> N 517545602, O 12. The Excel template used to split
+# this with a FORMULA in columns N/O -- which the app cannot rely on: all
+# writes are deferred to the end of the run, so step 2 would read N/O
+# before M exists in the sheet, and the formula itself is easily lost when
+# a sheet is copied. The split lives here instead; anything that does not
+# look like the encoded form (blank, 'NOT FOUND', a plain dock name)
+# yields "", which step 2 then skips as a row without a reservation.
+
+def _reservation_from_unloading_point(v) -> str:
+    s = str(v or "").strip()
+    if len(s) < 5 or not s.isdigit():
+        return ""
+    return s[:-4].lstrip("0") or "0"
+
+
+def _item_from_unloading_point(v) -> str:
+    s = str(v or "").strip()
+    if len(s) < 5 or not s.isdigit():
+        return ""
+    return s[-4:].lstrip("0") or "0"
+
+
 WORKFLOWS = {
     "TO": [
         LookupStep(
@@ -191,6 +221,17 @@ WORKFLOWS = {
             sap_key_columns=["TANUM"],            # LTAP TO number field
             sap_output_columns=["ABLAD"],
             excel_output_columns=[13],            # M
+            extras=[
+                # The template formula, moved into the pipeline: N and O
+                # are split out of the unloading point so step 2 can key on
+                # them (in memory -- no Excel round trip) and the sheet
+                # still shows them for auditing. Non-match rows get ""
+                # like every other output.
+                ExtraOutput(excel_col=14, sap_col="ABLAD",
+                            transform=_reservation_from_unloading_point),
+                ExtraOutput(excel_col=15, sap_col="ABLAD",
+                            transform=_item_from_unloading_point),
+            ],
         ),
         LookupStep(
             # Keyed on the reservation pair, exactly like the ESA
@@ -574,12 +615,18 @@ def _read_sap_export(path: str, log=None) -> pd.DataFrame:
         raw = fh.read()
     head = raw[:2048]
 
+    # dtype=str everywhere: pandas' numeric inference would eat the
+    # leading zeros of encoded values -- the ESA unloading point
+    # '00000001000001' must not come back as the number 1000001, or the
+    # reservation split (and any key match on it) silently corrupts.
+    # normalize_key canonicalizes both sides of every join, so all-string
+    # frames match exactly the rows inferred-numeric frames would.
     if head.startswith(_ZIP_MAGIC):
-        return pd.read_excel(path, engine="openpyxl")
+        return pd.read_excel(path, engine="openpyxl", dtype=str)
 
     if head.startswith(_OLE2_MAGIC):
         try:
-            return pd.read_excel(path, engine="xlrd")
+            return pd.read_excel(path, engine="xlrd", dtype=str)
         except ImportError as e:
             raise RuntimeError(
                 f"SAP exported a legacy .xls workbook ({path}); reading it "
@@ -1148,15 +1195,30 @@ def _fetch_step(
 
     # --- 6. Publish outputs for downstream steps (Gen 4) -----------------
     # Later steps key off these values from memory instead of re-reading an
-    # Excel write-back. Only main-block outputs are published -- no current
-    # workflow keys off an extras column (extras also depend on EXISTING
-    # cell content, which only the write-back phase reads).
+    # Excel write-back.
     for j, sap_c in enumerate(step.sap_output_columns):
         col_values = []
         for entry in entries_by_row:
             v = entry[sap_c] if entry is not None else ""
             col_values.append("" if v is None else v)
         vsheet.publish(step.excel_output_columns[j], col_values)
+    # Extras are published too when they are a pure function of the fetch
+    # (a SAP source and no preserve-on-nonmatch dependence on existing cell
+    # content): TO step 2 keys on N/O, which step 1 derives from ABLAD.
+    for extra in step.extras:
+        if extra.sap_col is None or extra.preserve_on_nonmatch:
+            continue
+        col_values = []
+        for entry in entries_by_row:
+            if entry is None:
+                col_values.append("")
+                continue
+            v = entry[extra.sap_col]
+            v = "" if v is None else v
+            if extra.transform is not None:
+                v = extra.transform(v)
+            col_values.append(v)
+        vsheet.publish(extra.excel_col, col_values)
 
     non_skip = n_rows - n_skipped
     unmatched = non_skip - matched
@@ -1296,7 +1358,10 @@ def _write_back(
                             col_data.append([existing_val])
                         else:
                             v = entry[extra.sap_col]
-                            col_data.append(["" if v is None else v])
+                            v = "" if v is None else v
+                            if extra.transform is not None:
+                                v = extra.transform(v)
+                            col_data.append([v])
                     else:
                         # Non-match OR skip (treated the same, per notebook).
                         if extra.preserve_on_nonmatch:

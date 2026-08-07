@@ -69,12 +69,16 @@ class TestExportFallback:
         ok, _ = env.run("TO")
         assert ok
         assert [k for k, _ in env.events].count("export") == 3
-        env.assert_cells(EXPECTED_TO)
+        # The export path reads everything as str (dtype=str keeps leading
+        # zeros); the grid path returns SAP's native types. Both land in
+        # text-formatted cells, so compare values stringified.
+        for k, v in EXPECTED_TO.items():
+            assert str(env.grid.get(k)) == str(v), (k, env.grid.get(k), v)
 
     def test_missing_technical_name_falls_back_rather_than_failing(self, env):
         """A field absent from the displayed variant must not kill the run."""
         env.sap_tables["LTAP"] = pd.DataFrame({
-            "TANUM": ["T001", "T002"], "ABLAD": ["DockA", "DockB"]})
+            "TANUM": ["T001", "T002"], "ABLAD": ["00000001000001", "00000002000002"]})
         env.no_grid_tables.add("LTAP")
         env.grid = make_to_grid()
         ok, _ = env.run("TO")
@@ -92,5 +96,7 @@ class TestRowCountGuard:
         # The aborting step (2) must write nothing. Step 1 completed before
         # it, so its column M is salvaged -- see TestFailureAtomicity.
         changed = {k: v for k, v in env.grid.items() if seed.get(k) != v}
-        assert changed == {(2, 13): "DockA", (3, 13): "DockB"}, (
-            "only the completed step's column may change on abort")
+        assert changed == {(2, 13): "00000001000001", (3, 13): "00000002000002",
+                           (2, 14): "100", (3, 14): "200",
+                           (2, 15): "1", (3, 15): "2"}, (
+            "only the completed step's columns may change on abort")

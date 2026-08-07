@@ -410,12 +410,15 @@ Do not hand-edit this notebook.
 
 | Step | Reads | SAP table | Writes |
 |------|-------|-----------|--------|
-| 1 | Col **K** (TO Number) | `LTAP` | Unloading Point -> **M** |
-| 2 | Col **N + O** (Reservation + Item) | `Z50CFG_ENG_CRNT` | Notification -> **A** (matched rows only), Object / Material / Qty -> **C, D, E**, match key -> **P** |
+| 1 | Col **K** (TO Number) | `LTAP` | Unloading Point -> **M**, and the reservation pair hidden inside it -> **N + O** |
+| 2 | Col **N + O** (filled by step 1) | `Z50CFG_ENG_CRNT` | Notification -> **A** (matched rows only), Object / Material / Qty -> **C, D, E**, match key -> **P** |
 | 3 | Col **C** (Object Number) | `Z50CFG_ENG_VALD` | Section / Module / Description / Sales Doc. -> **F, G, H, I** |
 
-Rows without a TO number or reservation pair are skipped -- and their
-column A is left untouched, so the Notification process can fill them next.
+Step 1 splits the unloading point (`05175455500001`) into the
+reservation number (`517545550`) and item (`1`) itself -- the Excel
+template's old formula in N/O is no longer needed. Rows without a TO
+number or unloading point are skipped, and their column A is left
+untouched so the Notification process can fill them next.
 """),
     code(TO_CELL),
 
