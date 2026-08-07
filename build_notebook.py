@@ -303,7 +303,8 @@ NOTIF_CELL = """\
 # =========================================================
 # Notification Number Process   (run the "Utility class" cell first)
 # =========================================================
-POPUPS = True     # message box after each step -- same one-line switch
+POPUPS = True     # same switch: True = write+save+popup per step,
+                  # False = fast mode (one write at the end)
 DRY_RUN = False   # True = report match counts only, write nothing
 EXCEL_PATH = r""  # paste the workbook's full path here, or leave "" to browse
 
@@ -371,8 +372,11 @@ exactly as they were).
 2. Run the **Utility class for data pulling** cell first. Nothing to
    read or change in it, and running it again is always harmless.
 3. Run YOUR process cell: **TO Number Process** or **Notification Number
-   Process**. A message box reports each step: **OK** = continue,
-   **Cancel** = stop with the workbook untouched.
+   Process**. With `POPUPS = True` every step is **written and saved**,
+   then its message box shows the counts -- switch to Excel and look at
+   the sheet before clicking **OK**. **Cancel** stops the run (steps
+   already written stay). With `POPUPS = False`: fast mode, everything is
+   written once at the end.
 
 On a combined sheet run the **TO process FIRST**, then the Notification
 process -- the second pass fills the notification-only rows (usually most

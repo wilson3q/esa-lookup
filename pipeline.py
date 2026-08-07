@@ -1303,25 +1303,21 @@ def _fetch_step(
         unmatched=unmatched,
         sap_rows=sap_rows_total,
     )
-    if step_popups:
-        # The original notebook's per-step message box, counts and all. The
-        # operator can look at the SAP result grid (still on screen) before
-        # clicking OK; Cancel stops the run with the workbook untouched.
-        key_cols = "/".join(_col_letter(c) for c in sorted(step.key_columns))
-        out_cols = ", ".join(_step_columns(step))
-        _step_popup(
-            on_event, stop,
-            f"Step {step_index + 1} of {total_steps} completed",
-            f"{step.name}\n\n"
-            f"SAP {step.sap_table} rows detected: {sap_rows_total}\n"
-            f"Matched: {matched}\n"
-            f"Not matched: {unmatched}\n"
-            f"Skipped (blank / NOT FOUND): {n_skipped}\n\n"
-            f"Keys were read from column(s) {key_cols}.\n"
-            f"Results go to column(s) {out_cols}, written together at the "
-            f"end of the run.\n\n"
-            f"OK = continue, Cancel = stop the run (workbook untouched).")
     return result
+
+
+def _step_summary(res: StepResult, total_steps: int, tail: str) -> str:
+    """The original notebook's per-step message box body, counts and all."""
+    step = res.step
+    key_cols = "/".join(_col_letter(c) for c in sorted(step.key_columns))
+    out_cols = ", ".join(_step_columns(step))
+    return (f"{step.name}\n\n"
+            f"SAP {step.sap_table} rows detected: {res.sap_rows}\n"
+            f"Matched: {res.matched}\n"
+            f"Not matched: {res.unmatched}\n"
+            f"Skipped (blank / NOT FOUND): {res.n_skipped}\n\n"
+            f"Keys were read from column(s) {key_cols}; results go to "
+            f"column(s) {out_cols}.\n" + tail)
 
 
 def _write_back(
@@ -1505,6 +1501,10 @@ def _salvage_completed_steps(
     """
     if dry_run or not results or xl is None:
         return write_state, ""
+    if write_state == "stepwise":
+        # Step-by-step mode already wrote (and saved) every completed step
+        # the moment it finished -- nothing to salvage.
+        return write_state, ""
     if write_state != "none":
         # The failure was already inside the final write-back; re-running it
         # would double-apply. Leave it to the 'partial' warning.
@@ -1551,6 +1551,10 @@ def _write_state_text(write_state: str) -> str:
                      "WRITTEN / NOT RUN in the log) and has been saved. "
                      "Re-running after the fix is safe -- every step "
                      "rewrites its own columns from scratch."),
+        "stepwise": ("Steps completed so far are ALREADY written and "
+                     "saved in the workbook (step-by-step mode); later "
+                     "steps were not run. Re-running is safe -- every step "
+                     "rewrites its own columns from scratch."),
         "partial": ("Failure happened DURING the final write-back -- the "
                     "workbook may be partially updated and has NOT been "
                     "saved. Review it before saving manually."),
@@ -1580,6 +1584,8 @@ def _log_write_state(on_event: EventFn, write_state: str) -> None:
              "failure)", "info")
     elif write_state == "salvaged":
         _log(on_event, _write_state_text("salvaged"), "warn")
+    elif write_state == "stepwise":
+        _log(on_event, _write_state_text("stepwise"), "warn")
     elif write_state == "partial":
         _log(on_event, "WARNING: " + _write_state_text("partial"), "warn")
 
@@ -1887,6 +1893,43 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
             totals_matched += res.matched
             totals_seen += res.matched + res.unmatched
 
+            if cfg.step_popups and not cfg.dry_run:
+                # Step-by-step mode = the original notebook, faithfully:
+                # this step's results are written AND SAVED before its
+                # message box, so the operator can switch to Excel and
+                # inspect real cells while the box waits. The price is
+                # that Cancel keeps the steps already written -- said in
+                # the box itself.
+                step_label = (f"writing step {i + 1} results to Excel "
+                              f"(step-by-step mode)")
+                _status(on_event, f"[{i + 1}/{total_steps}] writing this "
+                                  f"step's results to Excel")
+                _write_back([res], xl, on_event, total_steps,
+                            derived_cols if write_state == "none" else None)
+                try:
+                    excel_ops.save(xl.book)
+                except excel_ops.ExcelError as e:
+                    _log(on_event, f"WARNING: {e}", "warn")
+                write_state = "stepwise"
+                step_label = f"Step {i + 1} of {total_steps} ({step.sap_table})"
+                _step_popup(
+                    on_event, cfg.stop_event,
+                    f"Step {i + 1} of {total_steps} completed",
+                    _step_summary(
+                        res, total_steps,
+                        "\nThis step is ALREADY written and saved -- switch "
+                        "to Excel to inspect it now.\n\n"
+                        "OK = continue, Cancel = stop the run (steps written "
+                        "so far stay in the workbook)."))
+            elif cfg.step_popups:
+                _step_popup(
+                    on_event, cfg.stop_event,
+                    f"Step {i + 1} of {total_steps} completed",
+                    _step_summary(
+                        res, total_steps,
+                        "\nDRY RUN -- nothing is written.\n\n"
+                        "OK = continue, Cancel = stop the run."))
+
         if cfg.stop_event.is_set():
             raise Cancelled()
 
@@ -1905,11 +1948,18 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
             on_event("done", True)
             return True
 
-        # ---- Phase 2: single write-back pass + save ---------------------
-        step_label = "the final write-back to Excel"
-        write_state = "partial"
-        _write_back(results, xl, on_event, total_steps, derived_cols)
-        write_state = "done"
+        # ---- Phase 2: write + save ---------------------------------------
+        if write_state == "stepwise":
+            # Step-by-step mode wrote and saved each step as it finished.
+            _log(on_event,
+                 "all steps were already written and saved one at a time "
+                 "(step-by-step mode); nothing left to write", "ok")
+            write_state = "done"
+        else:
+            step_label = "the final write-back to Excel"
+            write_state = "partial"
+            _write_back(results, xl, on_event, total_steps, derived_cols)
+            write_state = "done"
 
         # Fix L: save() now raises ExcelError on failure; warn the user
         # rather than silently pretending the write persisted.
@@ -1923,7 +1973,10 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         # Notebook parity: the "Completed." message box with the counts.
         _popup(on_event, "info", "Completed",
                _run_summary_lines(results) + "\n\n"
-               + _write_state_text("done"))
+               + ("All steps were written and SAVED one at a time "
+                  "(step-by-step mode)."
+                  if cfg.step_popups and results else
+                  _write_state_text("done")))
         _progress(on_event, 1.0)
         on_event("done", True)
         return True

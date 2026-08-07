@@ -35,15 +35,32 @@ class TestStepPopups:
         assert "column(s) K" in msg                # where keys came from
         assert "M" in msg                          # where results go
 
-    def test_cancel_on_a_step_popup_stops_with_workbook_untouched(self, env):
+    def test_step_results_are_in_the_workbook_at_popup_time(self, env):
+        """Step-by-step mode IS the original notebook: the step is written
+        and SAVED before its box, so the operator can switch to Excel and
+        inspect real cells while the box waits."""
+        env.grid = make_to_grid()
+        seen_at_popup = []
+        env.popup_probe = lambda p: seen_at_popup.append(
+            (env.grid.get((2, 13)), ("write", "SAVE") in env.events))
+        ok, _ = env.run("TO", step_popups=True)
+        assert ok
+        # at the FIRST popup, step 1's column M was already written+saved
+        assert seen_at_popup[0] == ("00000001000001", True)
+
+    def test_cancel_on_a_step_popup_keeps_the_written_steps(self, env):
         env.grid = make_to_grid()
         env.popup_cancel_at = 1                    # press Cancel on popup 1
         ok, logs = env.run("TO", step_popups=True)
         assert not ok
         assert "cancelled" in logs
-        assert env.grid == make_to_grid()
-        # only the popup that was cancelled fired; no further SAP steps ran
+        # step 1 was written (step-by-step mode) and STAYS...
+        assert env.grid[(2, 13)] == "00000001000001"
+        # ...steps 2 and 3 never ran
+        assert env.grid[(2, 3)] == "STALE1"
         assert len(step_popups(env)) == 1
+        # and the box said so
+        assert "steps written so far stay" in step_popups(env)[0]["message"]
 
     def test_off_by_default_no_blocking_popups(self, env):
         env.grid = make_to_grid()

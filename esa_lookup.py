@@ -111,8 +111,9 @@ class App:
         self.workflow_var = tk.StringVar(value="TO")
         self.dryrun_var = tk.BooleanVar(value=False)
         # Default ON: the ESA operator troubleshoots through message boxes
-        # (the original notebook's behavior), screenshotting them together
-        # with the SAP screen. Error popups show regardless of this flag.
+        # (the original notebook's behavior) -- in this mode every step is
+        # also WRITTEN AND SAVED before its box, so the workbook can be
+        # inspected mid-run. Error popups show regardless of this flag.
         self.popup_var = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -138,9 +139,10 @@ class App:
             "   5.  Click 'Run'.  Do NOT close SAP GUI or Excel while it runs -\n"
             "        the app is driving both windows for you.\n"
             "\n"
-            "Watch Status / Progress / Log while it works.  Click 'Stop' to cancel -\n"
-            "nothing is written to the Excel file unless every SAP step succeeds.\n"
-            "When done, the file is filled in via one final write pass + saved."
+            "Watch Status / Progress / Log while it works.\n"
+            "Step-by-step mode (checkbox below, ON by default): each step is\n"
+            "written + saved, then a popup shows its counts - you can inspect\n"
+            "Excel before clicking OK.  Unticked: one write pass at the end."
         )
         ttk.Label(
             instr, text=instructions_text, style="Hint.TLabel",
@@ -193,7 +195,7 @@ class App:
             variable=self.dryrun_var,
         ).pack(side="left", padx=(12, 0))
         ttk.Checkbutton(
-            row3, text="Popup after each step",
+            row3, text="Step-by-step (write + popup after each step)",
             variable=self.popup_var,
         ).pack(side="left", padx=(12, 0))
         ttk.Label(

@@ -79,12 +79,15 @@ The original notebook talked to its operator through blocking message
 boxes, and that is how the ESA operator troubleshoots: screenshot the popup
 together with the SAP screen and send both. The app reproduces that:
 
-- **After each step** (checkbox *"Popup after each step"*, on by default): a
-  modal box with the notebook's counts -- SAP rows detected, matched, not
-  matched, skipped -- plus which columns were read and where results will be
-  written. **OK** continues; the SAP result grid is still on screen behind
-  the box, so it can be inspected first. **Cancel** stops the run with the
-  workbook untouched.
+- **After each step** (checkbox *"Step-by-step (write + popup after each
+  step)"*, on by default): the step's results are **written to the workbook
+  and saved first**, then a modal box shows the notebook's counts -- SAP
+  rows detected, matched, not matched, skipped. Both the SAP result grid
+  and the freshly-written Excel columns can be inspected while the box
+  waits. **Cancel** stops the run; steps already written stay. With the
+  checkbox off: fast mode -- one write at the very end, and a failure
+  before the end leaves the workbook untouched (completed steps are then
+  salvage-written).
 - **On any failure** (always, regardless of the checkbox): an error box with
   the failing step, SAP's own error text, a snapshot of the SAP screen at
   that moment (window title, open popups, status bar), the exact workbook

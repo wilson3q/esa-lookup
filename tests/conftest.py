@@ -307,6 +307,9 @@ class FakeEnv:
             if kind == "popup":
                 self.popups.append(payload)
                 if payload.get("ack") is not None:
+                    probe = getattr(self, "popup_probe", None)
+                    if probe is not None:
+                        probe(payload)
                     n_step = sum(1 for p in self.popups
                                  if p.get("ack") is not None)
                     if payload.get("result") is not None:
