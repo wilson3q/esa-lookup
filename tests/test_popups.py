@@ -69,6 +69,30 @@ class TestErrorPopup:
         # the workbook state must match what the log claims (salvage ran)
         assert "completed steps ONLY" in msg
 
+    def test_error_popup_names_the_action_in_flight(self, env):
+        """A com_error alone says nothing about WHERE; the popup must say
+        what the app was doing -- 'reading keys' points at Excel, 'sending
+        filter values' at SAP -- so a screenshot alone can be diagnosed."""
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_CRNT"
+        env.run("TO")
+        msg = [p for p in env.popups if p["kind"] == "error"][0]["message"]
+        assert "While doing:" in msg
+
+    def test_salvage_failure_is_named_in_the_error_popup(self, env):
+        """Two failures in one run (the step AND the salvage write) usually
+        share one cause -- the popup must show both, not silently fold the
+        second into a 'partially updated' sentence."""
+        env.grid = make_to_grid()
+        env.fail_table = "Z50CFG_ENG_VALD"     # step 3 dies...
+        env.write_fails = True                  # ...and so does the salvage
+        ok, _ = env.run("TO")
+        assert not ok
+        msg = [p for p in env.popups if p["kind"] == "error"][0]["message"]
+        assert "ALSO: writing the completed steps to Excel failed" in msg
+        assert "simulated Excel write failure" in msg
+        assert "Close the workbook WITHOUT saving" in msg
+
     def test_error_popup_fires_even_with_step_popups_off(self, env):
         env.grid = make_to_grid()
         env.fail_table = "LTAP"

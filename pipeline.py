@@ -1366,15 +1366,17 @@ def _salvage_completed_steps(
     applying that prefix is exactly what a successful run would have written
     for those steps.
 
-    Returns the new write_state. Never raises: a failure to salvage must not
-    replace the original error, which is the one worth reporting.
+    Returns (new_write_state, salvage_error_text). Never raises: a failure
+    to salvage must not replace the original error -- but it must not be
+    silent either, so its text travels back for the error popup (two
+    failures in one run usually share one cause).
     """
     if dry_run or not results or xl is None:
-        return write_state
+        return write_state, ""
     if write_state != "none":
         # The failure was already inside the final write-back; re-running it
         # would double-apply. Leave it to the 'partial' warning.
-        return write_state
+        return write_state, ""
 
     done = {res.step_index for res in results}
     missing = [(i, s) for i, s in enumerate(steps) if i not in done]
@@ -1398,14 +1400,14 @@ def _salvage_completed_steps(
             _log(on_event,
                  f"  NOT RUN  step {i + 1} ({s.sap_table}): columns "
                  f"{', '.join(_step_columns(s))} left as they were", "warn")
-        return "salvaged"
+        return "salvaged", ""
     except Exception as e:
         _log(on_event,
              f"WARNING: could not write the completed steps either ({e}). "
              f"The workbook may be partially updated -- review it before "
              f"saving.", "warn")
         _file_log_traceback()
-        return "partial"
+        return "partial", f"{type(e).__name__}: {e}"
 
 
 def _write_state_text(write_state: str) -> str:
@@ -1586,11 +1588,25 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     steps: list[LookupStep] = []
     results: list[StepResult] = []
     step_label = "startup (before any SAP step)"
+    salvage_error = ""
+
+    # Remember the last status line: when a run dies, "what was it DOING"
+    # is the single most valuable fact on the error popup -- a com_error
+    # during 'reading keys' points at Excel, during 'sending filter values'
+    # at SAP, without waiting for the log file to travel.
+    last_action = {"text": ""}
+    _caller_on_event = on_event
+
+    def on_event(kind, payload):  # noqa: shadows the parameter on purpose
+        if kind == "status":
+            last_action["text"] = payload
+        _caller_on_event(kind, payload)
 
     def _error_popup(err_text: str) -> None:
         """The original notebook's 'Error occurred' message box, upgraded
-        with what a remote debugger needs: the step, the SAP screen at the
-        moment of failure, the workbook state, and the log path."""
+        with what a remote debugger needs: the step, the exact action in
+        flight, the SAP screen at the moment of failure, the workbook
+        state, and the log path."""
         snapshot = ""
         if sap is not None:
             try:
@@ -1600,11 +1616,19 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _popup(
             on_event, "error", "esa-lookup -- error",
             f"Error occurred in {step_label}:\n\n{err_text}\n\n"
+            + (f"While doing: {last_action['text']}\n\n"
+               if last_action["text"] else "")
             + (f"SAP screen at the moment of failure:\n{snapshot}\n\n"
                if snapshot else "")
             + "The SAP window has been left exactly where it stopped.\n"
               "Please screenshot BOTH the SAP window and this message.\n\n"
             + _write_state_text(write_state)
+            + (f"\n\nALSO: writing the completed steps to Excel failed "
+               f"too:\n{salvage_error}\nTwo failures in one run usually "
+               f"share one cause -- most often Excel or the workbook was "
+               f"closed, or was being clicked/edited, while the run was in "
+               f"flight. Close the workbook WITHOUT saving and re-run."
+               if salvage_error else "")
             + (f"\n\nLog file (attach it when reporting):\n{log_path}"
                if log_path else ""))
 
@@ -1757,7 +1781,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     except sap_ops.SapError as e:
         _log(on_event, f"SAP error: {e}", "error")
         _file_log_traceback()  # full chain into the log file for post-mortem
-        write_state = _salvage_completed_steps(
+        write_state, salvage_error = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _error_popup(str(e))
@@ -1767,7 +1791,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     except excel_ops.ExcelError as e:
         _log(on_event, f"Excel error: {e}", "error")
         _file_log_traceback()
-        write_state = _salvage_completed_steps(
+        write_state, salvage_error = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _error_popup(str(e))
@@ -1778,7 +1802,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"unexpected error: {e}", "error")
         _log(on_event, traceback.format_exc(), "error")
         _file_log_traceback()
-        write_state = _salvage_completed_steps(
+        write_state, salvage_error = _salvage_completed_steps(
             results, steps, xl, on_event, write_state, cfg.dry_run)
         _log_write_state(on_event, write_state)
         _error_popup(f"{type(e).__name__}: {e}")

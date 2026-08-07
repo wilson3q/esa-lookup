@@ -383,9 +383,13 @@ def fill_multi_value_filter_from_file(
 
     if log:
         log(f"SAP: importing {len(values)} filter values from file")
-    s.find(push_button_id).press()
-    time.sleep(0.3)
     try:
+        # The opening press is INSIDE the try on purpose: a raw com_error
+        # here (stale control, screen not ready) must surface as SapError
+        # so the caller can attempt the clipboard fallback, not kill the
+        # run with an undiagnosed COM code.
+        s.find(push_button_id).press()
+        time.sleep(0.3)
         # Clear leftover values first (same rationale as the clipboard
         # path: the dialog retains contents within a session).
         try:

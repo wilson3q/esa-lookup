@@ -195,6 +195,8 @@ class FakeEnv:
                     for r in range(r1, r2 + 1)]
 
         def write(sheet, rng, vals):
+            if getattr(env, "write_fails", False):
+                raise RuntimeError("simulated Excel write failure")
             env.events.append(("write", rng))
             r1, c1, r2, c2 = parse_range(rng)
             for i, r in enumerate(range(r1, r2 + 1)):
