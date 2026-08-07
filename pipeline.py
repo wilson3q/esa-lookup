@@ -207,6 +207,50 @@ class LookupStep:
 # encoded form (blank, 'NOT FOUND', a plain dock name) yields "", which
 # step 2 then skips as a row without a reservation.
 
+# The scanned transfer order (column B) encodes the TO pair the same way.
+# Template formulas (verbatim, from the ESA operator, 2026-08-07):
+#
+#     K (TO Number):      =LEFT(B14,10)        chars 1..10
+#     L (TO Item Number): =MID(B14,11,4)       chars 11..14, keeps zeros
+#
+# '10098436690001' -> K '1009843669', L '0001'. Same fragility as the N/O
+# formulas (lost when a sheet is copied), so the split lives here too --
+# applied at run start, BEFORE step 1 keys on K. Unlike the formula, an
+# existing K/L value is kept when B is blank, so hand-typed TO numbers
+# still work on rows that were never scanned.
+
+def _to_number_from_scan(v) -> str:
+    s = clean_numeric_for_sap(v)
+    return s[:10] if s else ""
+
+
+def _to_item_from_scan(v) -> str:
+    s = clean_numeric_for_sap(v)
+    return s[10:14] if s else ""
+
+
+@dataclass
+class SheetDerivation:
+    """A template formula moved into the pipeline: target columns computed
+    from a source column at run start, published for the steps to key on,
+    and written to the sheet in the final pass (so the audit view the
+    operator knows is preserved). Per row, a target keeps its existing
+    sheet value when the derivation yields "" -- the derivations only ever
+    ADD information."""
+    source_col: int                                   # 1-based Excel column
+    targets: list[tuple[int, Callable[[str], str]]]   # (excel_col, fn)
+
+
+WORKFLOW_DERIVATIONS: dict[str, list[SheetDerivation]] = {
+    "TO": [SheetDerivation(
+        source_col=2,                                 # B: scanned TO
+        targets=[(11, _to_number_from_scan),          # K
+                 (12, _to_item_from_scan)],           # L
+    )],
+    "NOTIF": [],
+}
+
+
 def _reservation_from_unloading_point(v) -> str:
     s = str(v or "").strip()
     if len(s) < 5 or not s.isdigit():
@@ -1285,6 +1329,7 @@ def _write_back(
     xl: excel_ops.ExcelCtx,
     on_event: EventFn,
     total_steps: int,
+    derived_cols: list[tuple[int, list]] | None = None,
 ) -> None:
     """Apply every fetched step's writes to the workbook in ONE pass.
 
@@ -1302,6 +1347,17 @@ def _write_back(
     rows_count = int(sheet.Rows.Count)
 
     with excel_ops.bulk_write(xl.app):
+        # Template-formula derivations first (K/L from the scan in B): the
+        # values the steps keyed on, written where the formulas used to
+        # put them. Rows 2..len only -- these are input-side columns, so
+        # no clear-to-bottom.
+        for col, values in (derived_cols or []):
+            letter = _col_letter(col)
+            excel_ops.set_column_format_text(sheet, f"{letter}:{letter}")
+            excel_ops.write_range_2d(
+                sheet, f"{letter}2:{letter}{len(values) + 1}",
+                [[v] for v in values])
+
         for done, res in enumerate(results):
             step = res.step
             last_row = res.last_row
@@ -1428,6 +1484,7 @@ def _salvage_completed_steps(
     on_event: EventFn,
     write_state: str,
     dry_run: bool,
+    derived_cols: list[tuple[int, list]] | None = None,
 ) -> str:
     """A step failed. Write the steps that DID complete, and say plainly
     which columns are filled and which are not.
@@ -1460,7 +1517,7 @@ def _salvage_completed_steps(
              f"salvage: {len(results)} of {len(steps)} step(s) completed "
              f"before the failure -- writing those, leaving the rest alone",
              "warn")
-        _write_back(results, xl, on_event, len(steps))
+        _write_back(results, xl, on_event, len(steps), derived_cols)
         try:
             excel_ops.save(xl.book)
         except excel_ops.ExcelError as e:
@@ -1662,6 +1719,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
     sap = None
     steps: list[LookupStep] = []
     results: list[StepResult] = []
+    derived_cols: list[tuple[int, list]] = []
     step_label = "startup (before any SAP step)"
     salvage_error = ""
 
@@ -1751,12 +1809,46 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         steps = WORKFLOWS[cfg.workflow]
         total_steps = len(steps)
         tmp_dir = os.path.join(tempfile.gettempdir(), "esa_lookup")
+        vsheet = VirtualSheet(xl.sheet)
+
+        # ---- Phase 0: template-formula derivations (sheet -> sheet) -----
+        # The Excel template computed some columns from others with
+        # formulas (K/L out of the scan in B). Those formulas vanish when
+        # sheets are copied, so the app derives the values itself: merged
+        # with any existing cell content, published for the steps to key
+        # on, and written in the final pass. Must run BEFORE the pre-flight
+        # check -- a sheet with scans in B but a lost K formula is valid
+        # input.
+        for d in WORKFLOW_DERIVATIONS.get(cfg.workflow, []):
+            last = max([vsheet.last_row(d.source_col)]
+                       + [vsheet.last_row(c) for c, _ in d.targets])
+            if last < 2:
+                continue
+            src_vals = vsheet.get_col(d.source_col, last)
+            for t_col, fn in d.targets:
+                existing = vsheet.get_col(t_col, last)
+                merged, n_derived = [], 0
+                for s_v, e_v in zip(src_vals, existing):
+                    v = fn(s_v)
+                    if v:
+                        n_derived += 1
+                    else:
+                        v = "" if e_v is None else e_v
+                    merged.append(v)
+                if not n_derived:
+                    continue   # nothing to add -- leave column untouched
+                vsheet.publish(t_col, merged)
+                derived_cols.append((t_col, merged))
+                _log(on_event,
+                     f"derived column {_col_letter(t_col)} from column "
+                     f"{_col_letter(d.source_col)} for {n_derived} row(s) "
+                     f"(the template's formula, applied by the app)")
 
         # Pre-flight: verify the workflow's primary input column has data
         # before we even spin up SAP navigation. Later steps derive their
         # own last_row (Fix F) and skip themselves if their column is empty.
         primary_col = steps[0].key_columns[0]
-        primary_last = excel_ops.last_row_in_column(xl.sheet, primary_col)
+        primary_last = vsheet.last_row(primary_col)
         if primary_last < 2:
             _log(on_event,
                  f"No data below the header in column "
@@ -1779,7 +1871,6 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
              "after every SAP step has succeeded")
 
         # ---- Phase 1: fetch every step from SAP (no workbook writes) ----
-        vsheet = VirtualSheet(xl.sheet)
         totals_matched = 0
         totals_seen = 0
         for i, step in enumerate(steps):
@@ -1817,7 +1908,7 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         # ---- Phase 2: single write-back pass + save ---------------------
         step_label = "the final write-back to Excel"
         write_state = "partial"
-        _write_back(results, xl, on_event, total_steps)
+        _write_back(results, xl, on_event, total_steps, derived_cols)
         write_state = "done"
 
         # Fix L: save() now raises ExcelError on failure; warn the user
@@ -1857,7 +1948,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"SAP error: {e}", "error")
         _file_log_traceback()  # full chain into the log file for post-mortem
         write_state, salvage_error = _salvage_completed_steps(
-            results, steps, xl, on_event, write_state, cfg.dry_run)
+            results, steps, xl, on_event, write_state, cfg.dry_run,
+            derived_cols)
         _log_write_state(on_event, write_state)
         _error_popup(str(e))
         _status(on_event, "SAP error")
@@ -1867,7 +1959,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, f"Excel error: {e}", "error")
         _file_log_traceback()
         write_state, salvage_error = _salvage_completed_steps(
-            results, steps, xl, on_event, write_state, cfg.dry_run)
+            results, steps, xl, on_event, write_state, cfg.dry_run,
+            derived_cols)
         _log_write_state(on_event, write_state)
         _error_popup(str(e))
         _status(on_event, "Excel error")
@@ -1878,7 +1971,8 @@ def run(cfg: RunConfig, on_event: EventFn) -> bool:
         _log(on_event, traceback.format_exc(), "error")
         _file_log_traceback()
         write_state, salvage_error = _salvage_completed_steps(
-            results, steps, xl, on_event, write_state, cfg.dry_run)
+            results, steps, xl, on_event, write_state, cfg.dry_run,
+            derived_cols)
         _log_write_state(on_event, write_state)
         _error_popup(f"{type(e).__name__}: {e}")
         _status(on_event, "failed")

@@ -126,6 +126,12 @@ notification results (each pass clears its output columns before refilling).
 
 ### TO Number process (3 steps)
 
+Before step 1, the app applies the template's scan-split formulas itself:
+K (TO Number) and L (TO Item) are derived from the scan in column B
+(`=LEFT(B,10)` / `=MID(B,11,4)`) wherever B is filled; existing K/L values
+are kept on rows without a scan. No template formula is needed.
+
+
 | # | Read from | SAP table         | SAP filter field   | Writes to Excel columns |
 |---|-----------|-------------------|--------------------|--------------------------|
 | 1 | Col K     | `LTAP`            | TO Number          | `ABLAD` -> M, reservation pair split out of `ABLAD` -> N + O |

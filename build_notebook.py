@@ -414,9 +414,11 @@ Do not hand-edit this notebook.
 | 2 | Col **N + O** (filled by step 1) | `Z50CFG_ENG_CRNT` | Notification -> **A** (matched rows only), Object / Material / Qty -> **C, D, E**, match key -> **P** |
 | 3 | Col **C** (Object Number) | `Z50CFG_ENG_VALD` | Section / Module / Description / Sales Doc. -> **F, G, H, I** |
 
-Step 1 splits the unloading point (`05175455500001`) into the
-reservation number (`517545550`) and item (`1`) itself -- the Excel
-template's old formula in N/O is no longer needed. Rows without a TO
+The template's formulas are all applied by the app itself, so none are
+needed in the sheet: K/L are split out of the scan in column B
+(`=LEFT(B,10)` / `=MID(B,11,4)`), and step 1 splits the unloading point
+(`05175455500001`) into the reservation number (`517545550`) and item
+(`1`) for N/O. Rows without a TO
 number or unloading point are skipped, and their column A is left
 untouched so the Notification process can fill them next.
 """),
