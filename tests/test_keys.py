@@ -115,3 +115,53 @@ class TestBuildLookup:
         df = pd.DataFrame({"TANUM": ["T1"], "ABLAD": [float("nan")]})
         lookup, _, _ = _build_lookup(df, ["TANUM"], ["ABLAD"])
         assert lookup["T1"]["ABLAD"] == ""
+
+
+class TestUnloadingPointSplit:
+    """The template formulas, pinned as executable truth (operator-supplied
+    2026-08-07):  N: =IFERROR(VALUE(MID(M,2,9)),"")
+                  O: =IFERROR(VALUE(MID(M,11,4)),"")
+    """
+
+    @staticmethod
+    def _formula_n(m):     # Excel MID is 1-based; VALUE strips zeros
+        s = str(m)[1:10]
+        return str(int(s)) if s.isdigit() else ""
+
+    @staticmethod
+    def _formula_o(m):
+        s = str(m)[10:14]
+        return str(int(s)) if s.isdigit() else ""
+
+    def test_live_workbook_samples(self):
+        from pipeline import (_item_from_unloading_point,
+                              _reservation_from_unloading_point)
+        for ablad, n, o in [("05175455500001", "517545550", "1"),
+                            ("05175456020012", "517545602", "12"),
+                            ("05181461210005", "518146121", "5"),
+                            ("05181461370012", "518146137", "12")]:
+            assert _reservation_from_unloading_point(ablad) == n
+            assert _item_from_unloading_point(ablad) == o
+
+    def test_agrees_with_the_template_formula_on_encoded_values(self):
+        from pipeline import (_item_from_unloading_point,
+                              _reservation_from_unloading_point)
+        # every 14-digit value starting with '0' -- the entire observed
+        # population -- must give exactly what the template formula gave
+        for ablad in ("05175455500001", "00000001000001", "09999999990120",
+                      "05181461210005", "00000000010001"):
+            assert _reservation_from_unloading_point(ablad) == self._formula_n(ablad)
+            assert _item_from_unloading_point(ablad) == self._formula_o(ablad)
+
+    def test_keeps_a_10_digit_reservation_the_formula_would_truncate(self):
+        from pipeline import _reservation_from_unloading_point
+        # first char nonzero: formula MID(2,9) silently drops it
+        assert _reservation_from_unloading_point("15175455500001") == "1517545550"
+        assert self._formula_n("15175455500001") == "517545550"  # the bug we avoid
+
+    def test_non_encoded_values_yield_blank(self):
+        from pipeline import (_item_from_unloading_point,
+                              _reservation_from_unloading_point)
+        for bad in ("", None, "NOT FOUND", "BAY-07", "12A4", "123"):
+            assert _reservation_from_unloading_point(bad) == ""
+            assert _item_from_unloading_point(bad) == ""

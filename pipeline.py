@@ -186,16 +186,26 @@ class LookupStep:
     match_key_header: str = "Excel Match Key Used"
 
 
-# The ESA unloading point (LTAP ABLAD) encodes the reservation pair:
-# 10-digit zero-padded reservation number + 4-digit item. Example from the
-# live workbook: ABLAD '05175455500001' -> N 517545550, O 1;
-# '05175456020012' -> N 517545602, O 12. The Excel template used to split
-# this with a FORMULA in columns N/O -- which the app cannot rely on: all
-# writes are deferred to the end of the run, so step 2 would read N/O
-# before M exists in the sheet, and the formula itself is easily lost when
-# a sheet is copied. The split lives here instead; anything that does not
-# look like the encoded form (blank, 'NOT FOUND', a plain dock name)
-# yields "", which step 2 then skips as a row without a reservation.
+# The ESA unloading point (LTAP ABLAD) encodes the reservation pair.
+# The Excel template split it with formulas in N and O (verbatim, from the
+# ESA operator, 2026-08-07):
+#
+#     N: =IFERROR(VALUE(MID(M12,2,9)),"")     chars 2..10 -> number
+#     O: =IFERROR(VALUE(MID(M4,11,4)),"")     chars 11..14 -> number
+#
+# i.e. a 14-char value '05175455500001' -> N 517545550, O 1. The app
+# cannot rely on that formula: all writes are deferred to the end of the
+# run, so step 2 would read N/O before M exists in the sheet -- and the
+# formula is easily lost when a sheet is copied (which is how this
+# surfaced). The split lives here instead.
+#
+# One deliberate divergence: the formula ALWAYS discards character 1;
+# this code keeps it and strips leading zeros. Identical output for every
+# value starting with '0' (all observed data), but SAP's RSNUM is 10
+# digits -- if one ever uses all 10, the formula silently truncates it
+# while this code still matches. Anything that does not look like the
+# encoded form (blank, 'NOT FOUND', a plain dock name) yields "", which
+# step 2 then skips as a row without a reservation.
 
 def _reservation_from_unloading_point(v) -> str:
     s = str(v or "").strip()
